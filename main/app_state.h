@@ -28,6 +28,7 @@ typedef enum {
     APP_STATE_ERROR,
     APP_STATE_SLEEP,
     APP_STATE_CANCELLING,
+    APP_STATE_PROVISIONING,
 } app_state_t;
 
 const char *app_state_name(app_state_t state);

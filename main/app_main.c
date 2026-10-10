@@ -45,6 +45,8 @@
 #include "audio_in.h"
 #include "wake_word.h"
 #include "mqtt_service.h"
+#include "provisioning_service.h"
+#include "cJSON.h"
 
 static const char *TAG = "app_main";
 
@@ -88,6 +90,7 @@ static esp_err_t system_init(void)
 
     ESP_ERROR_CHECK(ws_service_init());
     ESP_ERROR_CHECK(mqtt_service_init(s_bus));
+    ESP_ERROR_CHECK(provisioning_service_init(s_bus));
     audio_in_config_t input_config = audio_in_default_config();
     input_config.bus = s_bus;
     if (!audio_in_create(&input_config)) return ESP_ERR_NO_MEM;
@@ -167,7 +170,12 @@ static void main_task(void *arg)
     led_set_wifi_err();
     char ssid[33], password[65];
     cfg_get_wifi_credential(ssid, sizeof(ssid), password, sizeof(password));
-    wifi_service_start(ssid, password);
+    if (ssid[0] == '\0') {
+        app_state_set(APP_STATE_PROVISIONING);
+        provisioning_service_start();
+    } else {
+        wifi_service_start(ssid, password);
+    }
 
     while (1) {
         event_t event;
@@ -191,9 +199,35 @@ static void main_task(void *arg)
                 led_set_waiting_wake();
 
                 break;
+            case EV_PROVISIONING_DONE:
+                provisioning_service_stop();
+                cfg_get_wifi_credential(ssid, sizeof(ssid), password, sizeof(password));
+                wifi_service_start(ssid, password);
+                break;
+            case EV_PROVISIONING_TIMEOUT:
+                ESP_LOGW(TAG, "Provisioning timeout; leaving config mode");
+                provisioning_service_stop();
+                break;
+            case EV_MQTT_COMMAND: {
+                const char *json = (const char *)event.payload;
+                cJSON *root = cJSON_Parse(json);
+                cJSON *type = root ? cJSON_GetObjectItem(root, "type") : NULL;
+                if (cJSON_IsString(type) && strcmp(type->valuestring, "enter_provisioning") == 0) {
+                    (void)mqtt_service_stop();
+                    provisioning_service_start();
+                    app_state_set(APP_STATE_PROVISIONING);
+                }
+                if (root) cJSON_Delete(root);
+                break;
+            }
             case EV_WIFI_DISCONNECTED:
             case EV_WIFI_CONNECT_FAILED:
                 (void)mqtt_service_stop();
+                if (event.type == EV_WIFI_CONNECT_FAILED) {
+                    provisioning_service_rollback();
+                    provisioning_service_start();
+                    app_state_set(APP_STATE_PROVISIONING);
+                }
                 /* Wake-deferred flow: no auto-reconnect. Just back to WAIT_WAKE. */
                 /* Wi-Fi service keeps retrying on its own; once it recovers, EV_WIFI_GOT_IP fires. */
                 retry_at_ms = 0;

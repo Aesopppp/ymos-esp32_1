@@ -22,6 +22,7 @@ static const char *TAG = "cfg_service";
 #define NVS_PARTITION     "nvs"
 #define NVS_NAMESPACE     "korvo_cfg"
 #define MAX_STR_LEN       256
+#define CFG_SCHEMA_KEY     "schema_ver"
 
 /* ── 键名字符串映射表 ─────────────────────────────────────────────────────── */
 
@@ -85,6 +86,7 @@ esp_err_t cfg_service_init(void)
 
     /* 首次启动：用编译期默认值填充空白配置 */
     s_inited = true;
+    cfg_service_migrate();
     char tmp[256] = {0};
     if (nvs_get_str(s_nvs_handle, "wifi_ssid", tmp, &(size_t){sizeof(tmp)}) == ESP_ERR_NVS_NOT_FOUND) {
         cfg_service_set_str(CFG_KEY_WIFI_SSID, DEFAULT_WIFI_SSID);
@@ -99,6 +101,51 @@ esp_err_t cfg_service_init(void)
 
     ESP_LOGI(TAG, "cfg_service init ok (partition='%s')", NVS_PARTITION);
     return ESP_OK;
+}
+
+esp_err_t cfg_service_migrate(void)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    uint16_t version = 0;
+    esp_err_t err = nvs_get_u16(s_nvs_handle, CFG_SCHEMA_KEY, &version);
+    if (err == ESP_ERR_NVS_NOT_FOUND) version = 1;
+    if (version < CFG_SCHEMA_VERSION) {
+        /* Version 1 stored mqtt_port as i32; keep that representation so
+         * existing devices can migrate without an NVS type collision. */
+        nvs_set_u16(s_nvs_handle, CFG_SCHEMA_KEY, CFG_SCHEMA_VERSION);
+        err = nvs_commit(s_nvs_handle);
+        ESP_LOGI(TAG, "NVS schema migrated %u -> %u", version, CFG_SCHEMA_VERSION);
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t cfg_service_load(ymos_config_t *out)
+{
+    if (!out || !s_inited) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    out->schema_version = CFG_SCHEMA_VERSION;
+    cfg_get_wifi_credential(out->wifi_ssid, sizeof(out->wifi_ssid), out->wifi_password, sizeof(out->wifi_password));
+    cfg_service_get_str(CFG_KEY_ACOS_TOKEN, out->acos_token, sizeof(out->acos_token), DEFAULT_ACOS_TOKEN);
+    cfg_service_get_str(CFG_KEY_WS_URL, out->ws_url, sizeof(out->ws_url), ACOS_WS_URL);
+    cfg_service_get_str(CFG_KEY_DEVICE_ID, out->device_id, sizeof(out->device_id), "");
+    cfg_service_get_str(CFG_KEY_MQTT_HOST, out->mqtt_host, sizeof(out->mqtt_host), "mqtt://broker.emqx.io");
+    out->mqtt_port = (uint16_t)cfg_service_get_int(CFG_KEY_MQTT_PORT, 1883);
+    cfg_service_get_str(CFG_KEY_MQTT_CLIENT_ID, out->mqtt_client_id, sizeof(out->mqtt_client_id), "");
+    cfg_service_get_str(CFG_KEY_MQTT_USERNAME, out->mqtt_username, sizeof(out->mqtt_username), "");
+    cfg_service_get_str(CFG_KEY_MQTT_PASSWORD, out->mqtt_password, sizeof(out->mqtt_password), "");
+    cfg_service_get_str(CFG_KEY_MQTT_BASE_TOPIC, out->mqtt_base_topic, sizeof(out->mqtt_base_topic), "ymos/v1");
+    out->mqtt_enabled = cfg_service_get_bool(CFG_KEY_MQTT_ENABLED, true);
+    out->paired = cfg_service_is_paired();
+    return ESP_OK;
+}
+
+esp_err_t cfg_service_save(const ymos_config_t *c)
+{
+    if (!c || !s_inited || !c->wifi_ssid[0] || strlen(c->wifi_ssid) >= sizeof(c->wifi_ssid) || c->mqtt_port == 0) return ESP_ERR_INVALID_ARG;
+    nvs_set_str(s_nvs_handle, "wifi_ssid", c->wifi_ssid); nvs_set_str(s_nvs_handle, "wifi_pass", c->wifi_password);
+    nvs_set_i32(s_nvs_handle, "paired", c->paired ? 1 : 0); nvs_set_u16(s_nvs_handle, CFG_SCHEMA_KEY, CFG_SCHEMA_VERSION);
+    return nvs_commit(s_nvs_handle);
 }
 
 size_t cfg_service_get_str(cfg_key_t key, char *out, size_t out_size, const char *def)

@@ -18,6 +18,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "esp_timer.h"
 
 static const char *TAG = "wifi_service";
 
@@ -32,6 +33,20 @@ static const char *TAG = "wifi_service";
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static wifi_state_t s_wifi_state = WIFI_STATE_IDLE;
 static SemaphoreHandle_t s_mutex = NULL;
+static esp_timer_handle_t s_connect_timer = NULL;
+#define WIFI_CONNECT_TIMEOUT_MS 60000
+static wifi_state_t get_state(void);
+static void set_state(wifi_state_t st);
+
+static void wifi_connect_timeout(void *arg)
+{
+    (void)arg;
+    if (get_state() == WIFI_STATE_CONNECTING) {
+        ESP_LOGW(TAG, "Wi-Fi connection timeout after %d ms", WIFI_CONNECT_TIMEOUT_MS);
+        esp_wifi_disconnect();
+        set_state(WIFI_STATE_FAIL);
+    }
+}
 
 /* ── 工具 ─────────────────────────────────────────────────────────────────── */
 
@@ -103,6 +118,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
                 ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
                 set_state(WIFI_STATE_GOT_IP);
+                if (s_connect_timer) esp_timer_stop(s_connect_timer);
                 led_set_wifi_ok();
                 xEventGroupSetBits(s_wifi_event_group, WIFI_GOT_IP_BIT);
                 break;
@@ -126,11 +142,17 @@ esp_err_t wifi_service_init(void)
 
     s_wifi_event_group = xEventGroupCreate();
     if (!s_wifi_event_group) return ESP_FAIL;
+    const esp_timer_create_args_t timer_args = {
+        .callback = wifi_connect_timeout,
+        .name = "wifi_connect_timeout",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_connect_timer));
 
     /* 初始化 TCP/IP / netif */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
 
     /* 初始化 Wi-Fi 驱动 */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -246,6 +268,10 @@ void wifi_service_start(const char *ssid, const char *password)
     set_state(WIFI_STATE_CONNECTING);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    if (s_connect_timer) {
+        esp_timer_stop(s_connect_timer);
+        ESP_ERROR_CHECK(esp_timer_start_once(s_connect_timer, WIFI_CONNECT_TIMEOUT_MS * 1000ULL));
+    }
 
     ESP_LOGI(TAG, "Wi-Fi connecting to SSID='%s' (async)...", ssid);
 }
@@ -305,6 +331,11 @@ int8_t wifi_service_get_rssi(void)
 
 esp_err_t wifi_service_deinit(void)
 {
+    if (s_connect_timer) {
+        esp_timer_stop(s_connect_timer);
+        esp_timer_delete(s_connect_timer);
+        s_connect_timer = NULL;
+    }
     esp_wifi_stop();
     esp_wifi_deinit();
 

@@ -62,6 +62,24 @@ typedef enum {
     LED_MODE_OFF    = 2,   /* 关闭 LED */
 } led_mode_t;
 
+#define CFG_SCHEMA_VERSION 2
+typedef struct {
+    uint16_t schema_version;
+    char wifi_ssid[33];
+    char wifi_password[65];
+    char acos_token[256];
+    char ws_url[256];
+    char device_id[64];
+    char mqtt_host[128];
+    uint16_t mqtt_port;
+    char mqtt_client_id[64];
+    char mqtt_username[96];
+    char mqtt_password[128];
+    char mqtt_base_topic[96];
+    bool mqtt_enabled;
+    bool paired;
+} ymos_config_t;
+
 /* ── 公开 API ─────────────────────────────────────────────────────────────── */
 
 /**
@@ -70,6 +88,9 @@ typedef enum {
  * 必须在所有其他服务之前调用。
  */
 esp_err_t cfg_service_init(void);
+esp_err_t cfg_service_load(ymos_config_t *out);
+esp_err_t cfg_service_save(const ymos_config_t *config);
+esp_err_t cfg_service_migrate(void);
 
 /**
  * @brief 读取字符串配置

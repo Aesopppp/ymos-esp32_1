@@ -51,6 +51,8 @@ typedef enum {
     EV_MQTT_DISCONNECTED     = 51,
     EV_MQTT_ERROR            = 52,
     EV_MQTT_COMMAND          = 53,
+    EV_PROVISIONING_DONE    = 54,
+    EV_PROVISIONING_TIMEOUT  = 55,
 } app_event_id_t;
 
 #define EV_SYSTEM_WIFI_DISCONNECTED EV_WIFI_DISCONNECTED

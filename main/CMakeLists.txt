@@ -19,6 +19,7 @@ idf_component_register(
         "log_service.c"
         "mqtt_service.c"
         "mqtt_topics.c"
+        "provisioning_service.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_codec_dev
@@ -40,6 +41,7 @@ idf_component_register(
         esp_psram
         mbedtls
         mqtt
+        esp_http_server
 )
 
 # Suppress warnings from IDF headers in third-party code
