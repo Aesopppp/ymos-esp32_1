@@ -43,6 +43,14 @@ typedef enum {
     /* 系统 */
     CFG_KEY_PAIRED,
     CFG_KEY_LAST_ERROR,
+    CFG_KEY_MQTT_ENABLED,
+    CFG_KEY_MQTT_HOST,
+    CFG_KEY_MQTT_PORT,
+    CFG_KEY_MQTT_CLIENT_ID,
+    CFG_KEY_MQTT_USERNAME,
+    CFG_KEY_MQTT_PASSWORD,
+    CFG_KEY_MQTT_BASE_TOPIC,
+    CFG_KEY_CHIP_ID,
     CFG_KEY_MAX,
 } cfg_key_t;
 
@@ -130,6 +138,11 @@ esp_err_t cfg_service_mark_paired(void);
  */
 void cfg_get_wifi_credential(char *ssid_out, size_t ssid_size,
                              char *pass_out, size_t pass_size);
+
+/** Load or create stable hardware and business identity. */
+esp_err_t cfg_service_get_identity(char *chip_id, size_t chip_size,
+                                   char *device_id, size_t device_size,
+                                   char *client_id, size_t client_size);
 
 /**
  * @brief 获取 ACOS 服务器 host + token

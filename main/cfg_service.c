@@ -10,6 +10,7 @@
 #include <stdio.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_err.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -38,6 +39,8 @@ static const char *s_key_names[] = {
     "volume",
     "paired",
     "last_err",
+    "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_client_id",
+    "mqtt_username", "mqtt_password", "mqtt_base_topic", "chip_id",
     "",
 };
 
@@ -233,6 +236,35 @@ void cfg_get_wifi_credential(char *ssid_out, size_t ssid_size,
         cfg_service_get_str(CFG_KEY_WIFI_PASSWORD, pass_out, pass_size,
                            DEFAULT_WIFI_PASSWORD);
     }
+}
+
+esp_err_t cfg_service_get_identity(char *chip_id, size_t chip_size,
+                                   char *device_id, size_t device_size,
+                                   char *client_id, size_t client_size)
+{
+    if (!s_inited || !chip_id || !device_id || !client_id ||
+        chip_size < 13 || device_size < 6 || client_size < 6) return ESP_ERR_INVALID_ARG;
+    uint8_t mac[6];
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) return err;
+    snprintf(chip_id, chip_size, "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char derived[48];
+    snprintf(derived, sizeof(derived), "ymos-%s", chip_id);
+    cfg_service_get_str(CFG_KEY_DEVICE_ID, device_id, device_size, derived);
+    if (device_id[0] == '\0') {
+        cfg_service_set_str(CFG_KEY_DEVICE_ID, derived);
+        strncpy(device_id, derived, device_size - 1); device_id[device_size - 1] = 0;
+    }
+    char client_default[64];
+    snprintf(client_default, sizeof(client_default), "ymos-%s", chip_id);
+    cfg_service_get_str(CFG_KEY_MQTT_CLIENT_ID, client_id, client_size, client_default);
+    if (client_id[0] == '\0') {
+        cfg_service_set_str(CFG_KEY_MQTT_CLIENT_ID, client_default);
+        strncpy(client_id, client_default, client_size - 1); client_id[client_size - 1] = 0;
+    }
+    cfg_service_set_str(CFG_KEY_CHIP_ID, chip_id);
+    return ESP_OK;
 }
 
 /* ── ACOS 服务器信息（host 从 ws_url 解析） ───────────────────────────────── */

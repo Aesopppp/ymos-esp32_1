@@ -47,6 +47,10 @@ typedef enum {
     EV_AUDIO_BARGE_IN       = 23,
     EV_SYSTEM_SHUTDOWN      = 100,
     EV_SYSTEM_ERROR         = 101,
+    EV_MQTT_CONNECTED       = 50,
+    EV_MQTT_DISCONNECTED     = 51,
+    EV_MQTT_ERROR            = 52,
+    EV_MQTT_COMMAND          = 53,
 } app_event_id_t;
 
 #define EV_SYSTEM_WIFI_DISCONNECTED EV_WIFI_DISCONNECTED

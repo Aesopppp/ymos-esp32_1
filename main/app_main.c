@@ -44,6 +44,7 @@
 #include "proto_service.h"
 #include "audio_in.h"
 #include "wake_word.h"
+#include "mqtt_service.h"
 
 static const char *TAG = "app_main";
 
@@ -86,6 +87,7 @@ static esp_err_t system_init(void)
 
 
     ESP_ERROR_CHECK(ws_service_init());
+    ESP_ERROR_CHECK(mqtt_service_init(s_bus));
     audio_in_config_t input_config = audio_in_default_config();
     input_config.bus = s_bus;
     if (!audio_in_create(&input_config)) return ESP_ERR_NO_MEM;
@@ -175,6 +177,10 @@ static void main_task(void *arg)
             app_state_t current_state = app_state_get();
             switch (event.type) {
             case EV_WIFI_GOT_IP:
+                if (!mqtt_service_is_connected()) {
+                    esp_err_t mqtt_err = mqtt_service_start();
+                    if (mqtt_err != ESP_OK) ESP_LOGW(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_err));
+                }
                 /* Wake-deferred flow: Wi-Fi ready does NOT auto-open WebSocket. */
                 /* Device stays in WAIT_WAKE; WS will be opened on wake word. */
                 ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word before connecting");
@@ -187,6 +193,7 @@ static void main_task(void *arg)
                 break;
             case EV_WIFI_DISCONNECTED:
             case EV_WIFI_CONNECT_FAILED:
+                (void)mqtt_service_stop();
                 /* Wake-deferred flow: no auto-reconnect. Just back to WAIT_WAKE. */
                 /* Wi-Fi service keeps retrying on its own; once it recovers, EV_WIFI_GOT_IP fires. */
                 retry_at_ms = 0;
