@@ -28,7 +28,7 @@
 
 ### 软件
 
-- ESP-IDF 5.4.4
+- ESP-IDF 6.1.x
 - Xtensa ESP32-S3 GCC 工具链
 - Git for Windows（需要 `patch.exe`）
 - ESP-IDF 提供的 Python 环境
@@ -44,7 +44,7 @@ cd ymos-esp32
 
 ### 设置 ESP-IDF
 
-打开 ESP-IDF 5.4.4 PowerShell，或执行对应版本的 `export.ps1`：
+打开 ESP-IDF 6.1 PowerShell，或执行对应版本的 `export.ps1`：
 
 ```powershell
 idf.py --version

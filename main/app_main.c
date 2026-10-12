@@ -11,7 +11,7 @@
  * P1放音链路：ACOS WS(Opus) → Opus解码 → ES8311 DAC → NS4150功放 → 扬声器
  *              支持 Barge-In 打断
  *
- * 依赖：ESP-IDF v5.4.4 + esp-sr v2.5.3
+ * 依赖：ESP-IDF v6.1 + esp-sr
  */
 
 #include <stdio.h>
@@ -63,7 +63,7 @@ static led_service_t s_led;
 
 static esp_err_t system_init(void)
 {
-    ESP_LOGI(TAG, "=== Korvo Agent starting (ESP-IDF v5.4.4) ===");
+    ESP_LOGI(TAG, "=== Korvo Agent starting (ESP-IDF v6.1) ===");
 
 #if CONFIG_SPIRAM
     if (esp_psram_get_size() > 0) {

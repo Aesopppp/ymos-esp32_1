@@ -1,6 +1,6 @@
 /**
  * @file tca9554.c
- * @brief TCA9554 驱动实现 (ESP-IDF v5.4 i2c_master API)
+ * @brief TCA9554 驱动实现 (ESP-IDF 6.1 i2c_master API)
  */
 
 #include "tca9554.h"
