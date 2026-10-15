@@ -62,6 +62,21 @@ idf.py --version
 
 不要提交真实密码、Token、MQTT 密码或证书。设备已经保存过 NVS 配置时，NVS 优先级高于编译期默认值。
 
+本机测试若需要替换设备已经保存的 Wi-Fi，可创建 `main/wifi_local_config.h`
+（已加入 Git 忽略规则），填写：
+
+```c
+#pragma once
+#define LOCAL_WIFI_PRESET_ID 1U
+#define LOCAL_WIFI_SSID "你的热点名称"
+#define LOCAL_WIFI_PASSWORD "你的热点密码"
+```
+
+重新编译并烧录后，首次启动会将该预设写入 NVS，替换旧的 Wi-Fi 凭据；
+不会清除 ACOS、MQTT 或设备身份。相同预设编号只执行一次，之后网页配网保存的新网络仍生效。
+下次需要用固件切换网络时，修改凭据并更换为未使用过的预设编号。
+未提供本机配置文件时保持原有行为；移除文件不会删除已经写入设备的 NVS 配置。
+
 MQTT 配置字段包括 `mqtt_enabled`、`mqtt_host`、`mqtt_port`、`mqtt_client_id`、`mqtt_username`、`mqtt_password` 和 `mqtt_base_topic`。
 
 ### 编译
@@ -98,6 +113,11 @@ idf.py -p COM3 flash monitor
 3. 麦克风数据经过 AFE/VAD 和 Opus 编码后上传 ACOS。
 4. ACOS 返回 Opus 音频，设备解码并播放。
 5. 播放完成后恢复收音；静默超时后关闭会话并等待下一次唤醒。
+
+播放期间持续采集并保留约 1.5 秒预录音，确认打断后补传句首及取消等待期间的音频。
+打断判定允许最多 96 ms 的短暂弱音或停顿，要求 640 ms 内累计 480 ms 达标人声；
+同时保留播放起始 1200 ms 保护和能量门限。
+模块职责、诊断日志和测试方法见 [打断预录音与补传](docs/打断预录音与补传.md)。
 
 ### MQTT 状态和主题
 

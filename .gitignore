@@ -12,3 +12,4 @@ Thumbs.db
 .env
 .env.*
 __pycache__/
+/main/wifi_local_config.h

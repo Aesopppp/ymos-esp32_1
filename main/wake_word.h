@@ -108,6 +108,19 @@ RingbufHandle_t wake_word_get_ringbuf(void);
 /** Flush stale PCM with the upload task stopped. */
 void wake_word_clear_audio_buffer(void);
 
+/** 打断缓存快照；frames/samples 是启动补传前仍未读取的真实音频量。 */
+typedef struct {
+    uint32_t id;
+    size_t frames;
+    size_t samples;
+} wake_word_preroll_info_t;
+
+/** 仅由 audio_in 在开始读 ring buffer 前调用，获取本次需补传的 FIFO 前缀。 */
+bool wake_word_get_preroll_info(wake_word_preroll_info_t *info);
+
+/** 补传完成或中止时解除对应批次保护，返回保护期间因容量不足丢弃的新采样数。 */
+size_t wake_word_finish_preroll(uint32_t id);
+
 /**
  * @brief 获取 AFE fetch 帧大小（samples）
  *

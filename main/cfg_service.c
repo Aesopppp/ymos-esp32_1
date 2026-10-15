@@ -15,6 +15,11 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+/* 本机调试凭据不进 Git；未提供此文件的构建保持原有配网流程。 */
+#if __has_include("wifi_local_config.h")
+#include "wifi_local_config.h"
+#endif
+
 static const char *TAG = "cfg_service";
 
 /* ── 内部常量 ─────────────────────────────────────────────────────────────── */
@@ -66,6 +71,39 @@ static esp_err_t ensure_open(void)
     return nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs_handle);
 }
 
+static esp_err_t apply_local_wifi_preset(void)
+{
+#ifdef LOCAL_WIFI_PRESET_ID
+    _Static_assert(LOCAL_WIFI_PRESET_ID > 0, "Wi-Fi preset ID must be positive");
+    _Static_assert(sizeof(LOCAL_WIFI_SSID) > 1 && sizeof(LOCAL_WIFI_SSID) <= 32,
+                   "Wi-Fi preset SSID must contain 1 to 31 bytes");
+    _Static_assert(sizeof(LOCAL_WIFI_PASSWORD) == 1 ||
+                       (sizeof(LOCAL_WIFI_PASSWORD) >= 9 && sizeof(LOCAL_WIFI_PASSWORD) <= 64),
+                   "Wi-Fi preset password must be empty or contain 8 to 63 bytes");
+
+    /* 相同预设只应用一次：覆盖旧 Wi-Fi，但不覆盖用户之后通过网页保存的网络。
+     * 仅写 Wi-Fi 和应用标记，不擦除 ACOS、MQTT、设备身份等配置。
+     */
+    uint32_t applied_id = 0;
+    esp_err_t err = nvs_get_u32(s_nvs_handle, "wifi_preset_id", &applied_id);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
+    if (applied_id == LOCAL_WIFI_PRESET_ID) return ESP_OK;
+
+    err = nvs_set_str(s_nvs_handle, "wifi_ssid", LOCAL_WIFI_SSID);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(s_nvs_handle, "wifi_pass", LOCAL_WIFI_PASSWORD);
+    if (err != ESP_OK) return err;
+    /* 标记最后写入；此前失败时下次启动仍会重新应用完整凭据。 */
+    err = nvs_set_u32(s_nvs_handle, "wifi_preset_id", LOCAL_WIFI_PRESET_ID);
+    if (err != ESP_OK) return err;
+    err = nvs_commit(s_nvs_handle);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "Local Wi-Fi preset applied once (SSID='%s')", LOCAL_WIFI_SSID);
+#endif
+    return ESP_OK;
+}
+
 /* ── 公开 API ─────────────────────────────────────────────────────────────── */
 
 esp_err_t cfg_service_init(void)
@@ -87,6 +125,14 @@ esp_err_t cfg_service_init(void)
     /* 首次启动：用编译期默认值填充空白配置 */
     s_inited = true;
     cfg_service_migrate();
+    err = apply_local_wifi_preset();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Local Wi-Fi preset failed: %s", esp_err_to_name(err));
+        nvs_close(s_nvs_handle);
+        s_nvs_handle = 0;
+        s_inited = false;
+        return err;
+    }
     char tmp[256] = {0};
     if (nvs_get_str(s_nvs_handle, "wifi_ssid", tmp, &(size_t){sizeof(tmp)}) == ESP_ERR_NVS_NOT_FOUND) {
         cfg_service_set_str(CFG_KEY_WIFI_SSID, DEFAULT_WIFI_SSID);
