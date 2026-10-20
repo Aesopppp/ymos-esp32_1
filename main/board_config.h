@@ -2,7 +2,7 @@
  * @file board_config.h
  * @brief ESP32-S3-Korvo-2 V3.1.2 - *
  * SCH_ESP32-S3-Korvo-2_V3.1.2_20240116.pdf
- * IDF SP-IDF v5.4.4
+ * ESP-IDF v6.1
  */
 #ifndef BOARD_CONFIG_H
 #define BOARD_CONFIG_H

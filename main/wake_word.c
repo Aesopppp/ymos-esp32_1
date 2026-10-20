@@ -7,7 +7,7 @@
  *  detect_Task (core 1) : AFE fetch → WAKENET_DETECTED → 回调
  *
  * PCM 数据通过 ring buffer 共享给 audio_in：
- *  feed_Task 写 → ring buffer ← audio_in_task 读
+ *  detect_Task 写入 AFE 输出 → ring buffer → audio_in_task 编码上传
  */
 
 #include "wake_word.h"
@@ -28,9 +28,13 @@
 #include "freertos/idf_additions.h"
 #include <stdatomic.h>
 #include "barge_in_guard.h"
+#include "audio_preroll_policy.h"
 #include "esp_timer.h"
 
 static const char *TAG = "wake_word";
+
+_Static_assert(BARGE_IN_SAMPLE_RATE == BSP_I2S_SAMPLE_RATE,
+               "Barge-in timing must match the AFE sample rate");
 
 /* ===========================================================================
  * 全局状态
@@ -43,7 +47,7 @@ static void                    *s_afe_data_lite = NULL;  /* AEC+VAD only (no Wak
 static void                    *s_afe_data      = NULL;  /* Currently active handle */
 static wake_word_mode_t         s_mode          = WAKE_WORD_MODE_WAKE;
 
-/** ring buffer 句柄（feed_Task → audio_in） */
+/** ring buffer 句柄（detect_Task → audio_in） */
 static RingbufHandle_t  s_ringbuf = NULL;
 
 /** feed/detect 任务句柄 */
@@ -74,6 +78,97 @@ static int64_t s_playback_started_ms = 0;
 static bool s_playback_seen = false;
 static SemaphoreHandle_t s_audio_buffer_lock;
 static atomic_bool s_barge_reset_requested = false;
+
+/* 以下缓存状态由 s_audio_buffer_lock 保护；检测锁存与缓存保护分别管理。
+ * 恢复监听会清除检测锁存，但必须等补传成功后才能解除音频保护。
+ */
+static bool s_preroll_protected = false;
+static uint32_t s_preroll_id = 0;
+static size_t s_preroll_dropped_samples = 0;
+
+static size_t audio_buffer_frames_locked(void)
+{
+    UBaseType_t waiting = 0;
+    vRingbufferGetInfo(s_ringbuf, NULL, NULL, NULL, NULL, &waiting);
+    return waiting;
+}
+
+static bool discard_oldest_audio_locked(void)
+{
+    size_t bytes;
+    void *old = xRingbufferReceive(s_ringbuf, &bytes, 0);
+    if (!old) return false;
+    vRingbufferReturnItem(s_ringbuf, old);
+    return true;
+}
+
+/* 清空和模式切换共用此入口，防止恢复新会话时继承旧的缓存保护。调用方持锁。 */
+static void clear_audio_buffer_locked(void)
+{
+    while (discard_oldest_audio_locked()) {}
+    s_preroll_protected = false;
+    s_preroll_dropped_samples = 0;
+}
+
+/* 只在检测任务调用。当前 AFE 每项固定为一个 fetch 帧，队列项数就是 PCM 帧数。
+ * 返回非零批次号时，历史音频及当前确认帧已经受保护，可以发布打断事件。
+ */
+static uint32_t buffer_afe_audio(const afe_fetch_result_t *res, bool confirm_barge_in)
+{
+    if (!s_ringbuf || !res->data || res->data_size <= 0) return 0;
+    const size_t frame_bytes = (size_t)s_fetch_chunksize * sizeof(int16_t);
+    if ((size_t)res->data_size != frame_bytes) {
+        ESP_LOGW(TAG, "Unexpected AFE frame size: %d (expected %u)",
+                 res->data_size, (unsigned)frame_bytes);
+        return 0;
+    }
+
+    uint32_t protected_id = 0;
+    size_t protected_frames = 0;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    /* 在锁内重新读取状态，避免已恢复监听却按旧 PLAYING 状态裁剪缓存。 */
+    app_state_t current_state = app_state_get();
+    if (current_state != APP_STATE_LISTENING && current_state != APP_STATE_PLAYING &&
+        current_state != APP_STATE_CANCELLING) {
+        xSemaphoreGive(s_audio_buffer_lock);
+        return 0;
+    }
+
+    size_t discard = audio_preroll_frames_to_drop(audio_buffer_frames_locked(),
+        s_fetch_chunksize, current_state == APP_STATE_PLAYING, s_preroll_protected);
+    while (discard > 0 && discard_oldest_audio_locked()) --discard;
+
+    if (confirm_barge_in && current_state == APP_STATE_PLAYING && !s_preroll_protected) {
+        s_preroll_protected = true;
+        if (++s_preroll_id == 0) ++s_preroll_id;
+        s_preroll_dropped_samples = 0;
+        protected_id = s_preroll_id;
+    }
+
+    /* 正常监听超载时保留较新的音频；保护期间缓存满时丢新帧并报告，绝不静默删句首。
+     * 现有约 10 秒容量覆盖 1.5 秒预录音 + 最长 8 秒取消等待，无需再分配大缓存。
+     */
+    while (xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) != pdTRUE) {
+        if (s_preroll_protected) {
+            if (s_preroll_dropped_samples == 0) {
+                ESP_LOGW(TAG, "Barge-in buffer full: preserving prefix, dropping new audio (id=%lu)",
+                         (unsigned long)s_preroll_id);
+            }
+            s_preroll_dropped_samples += s_fetch_chunksize;
+            break;
+        }
+        if (!discard_oldest_audio_locked()) break;
+    }
+    if (protected_id) protected_frames = audio_buffer_frames_locked();
+    xSemaphoreGive(s_audio_buffer_lock);
+
+    if (protected_id) {
+        ESP_LOGI(TAG, "Barge-in pre-roll protected: id=%lu frames=%u audio_ms=%u",
+                 (unsigned long)protected_id, (unsigned)protected_frames,
+                 (unsigned)audio_preroll_samples_to_ms(protected_frames * s_fetch_chunksize));
+    }
+    return protected_id;
+}
 
 static int32_t afe_frame_energy(const int16_t *pcm, int samples)
 {
@@ -163,6 +258,22 @@ static void feed_Task(void *arg)
  * detect_Task — AFE fetch → 唤醒词检测
  * ========================================================================= */
 
+static const char *barge_in_result_name(barge_in_result_t result)
+{
+    switch (result) {
+    case BARGE_IN_WAIT_STARTUP:   return "startup_guard";
+    case BARGE_IN_INVALID_FRAME:  return "invalid_frame";
+    case BARGE_IN_WAIT_SPEECH:    return "not_speech";
+    case BARGE_IN_WAIT_ENERGY:    return "low_energy";
+    case BARGE_IN_COLLECTING:     return "collecting";
+    case BARGE_IN_GAP_TOLERATED:  return "short_gap";
+    case BARGE_IN_GAP_EXPIRED:    return "gap_expired";
+    case BARGE_IN_WINDOW_EXPIRED: return "window_expired";
+    case BARGE_IN_CONFIRMED:      return "confirmed";
+    default:                     return "unknown";
+    }
+}
+
 static void detect_Task(void *arg)
 {
     (void)arg;
@@ -177,12 +288,14 @@ static void detect_Task(void *arg)
     }
 
     ESP_LOGI(TAG, "detect_Task started (core %d)", xPortGetCoreID());
-    ESP_LOGI(TAG, "Playback barge-in guard: energy>=%d, sustained=480 ms, startup_guard=%u ms",
-             BARGE_IN_MIN_ENERGY, BARGE_IN_GUARD_MS);
+    ESP_LOGI(TAG, "Playback barge-in guard: energy>=%d, speech=%u ms, max_gap=%u ms, "
+             "window=%u ms, startup_guard=%u ms", BARGE_IN_MIN_ENERGY,
+             BARGE_IN_CONFIRM_MS, BARGE_IN_MAX_GAP_MS, BARGE_IN_WINDOW_MS, BARGE_IN_GUARD_MS);
 
     while (s_task_running) {
         /* 从 AFE 取回处理结果 */
         afe_fetch_result_t *res = s_afe_iface->fetch(s_afe_data);
+        bool confirm_barge_in = false;
 
         if (res == NULL || res->ret_value == ESP_FAIL) {
             barge_in_guard_reset(&s_barge_guard);
@@ -196,8 +309,9 @@ static void detect_Task(void *arg)
             s_barge_pending = false;
         }
 
-        /* Only validated sustained speech can request cancellation. Weak VAD
-         * residuals are logged without muting, dropping or pausing playback. */
+        /* 仅确认后请求取消。短暂弱音保留候选进度，但不计入有效人声时长；
+         * 未确认前不静音、不暂停、不丢弃播放数据。
+         */
         if (audio_out_is_streaming() && app_state_get() == APP_STATE_PLAYING) {
             if (!s_playback_seen) {
                 s_playback_seen = true;
@@ -208,22 +322,38 @@ static void detect_Task(void *arg)
             const int samples = res->data && res->data_size > 0
                                 ? res->data_size / sizeof(int16_t) : 0;
             const int32_t processed_energy = afe_frame_energy(res->data, samples);
-            bool confirmed = barge_in_guard_feed(&s_barge_guard,
-                res->vad_state == VAD_SPEECH, processed_energy, samples, playback_age);
-            if (!s_barge_pending && confirmed) {
-                if (event_bus_publish(EV_AUDIO_BARGE_IN, NULL, 0) == pdTRUE) {
-                    s_barge_pending = true;
-                    ESP_LOGI(TAG, "Barge-in confirmed: energy=%ld min=%ld max=%ld sustained=480 ms",
+            if (!s_barge_pending) {
+                const bool speech = res->vad_state == VAD_SPEECH;
+                const barge_in_guard_t before = s_barge_guard;
+                const barge_in_result_t result = barge_in_guard_feed(&s_barge_guard,
+                    speech, processed_energy, samples, playback_age);
+                if (result == BARGE_IN_CONFIRMED) {
+                    confirm_barge_in = true;
+                    ESP_LOGI(TAG, "Barge-in confirmed: energy=%ld min=%ld max=%ld "
+                             "speech_ms=%u window_ms=%u gaps_ms=%u",
                              (long)processed_energy, (long)s_barge_guard.min_energy,
-                             (long)s_barge_guard.max_energy);
+                             (long)s_barge_guard.max_energy,
+                             (unsigned)barge_in_samples_to_ms(s_barge_guard.samples),
+                             (unsigned)barge_in_samples_to_ms(s_barge_guard.window_samples),
+                             (unsigned)barge_in_samples_to_ms(
+                                 s_barge_guard.window_samples - s_barge_guard.samples));
+                } else if (now - s_barge_reject_log_ms >= 2000 &&
+                           (before.samples || s_barge_guard.samples ||
+                            (speech && processed_energy >= BARGE_IN_DIAGNOSTIC_ENERGY))) {
+                    /* 最多每 2 秒记录一次候选情况，避免逐帧日志影响音频处理。
+                     * 前后计数可区分仍在累计、短隙保留和超限清零；不能据此认定是人声还是回声。
+                     */
+                    s_barge_reject_log_ms = now;
+                    ESP_LOGI(TAG, "Barge-in pending: reason=%s vad=%d energy=%ld "
+                             "speech_ms=%u->%u window_ms=%u->%u gap_ms=%u->%u",
+                             barge_in_result_name(result), (int)speech, (long)processed_energy,
+                             (unsigned)barge_in_samples_to_ms(before.samples),
+                             (unsigned)barge_in_samples_to_ms(s_barge_guard.samples),
+                             (unsigned)barge_in_samples_to_ms(before.window_samples),
+                             (unsigned)barge_in_samples_to_ms(s_barge_guard.window_samples),
+                             (unsigned)barge_in_samples_to_ms(before.gap_samples),
+                             (unsigned)barge_in_samples_to_ms(s_barge_guard.gap_samples));
                 }
-            } else if (!s_barge_pending && res->vad_state == VAD_SPEECH &&
-                       processed_energy >= BARGE_IN_DIAGNOSTIC_ENERGY &&
-                       processed_energy < BARGE_IN_MIN_ENERGY &&
-                       now - s_barge_reject_log_ms >= 2000) {
-                s_barge_reject_log_ms = now;
-                ESP_LOGI(TAG, "Weak playback VAD ignored: energy=%ld threshold=%d; playback continues",
-                         (long)processed_energy, BARGE_IN_MIN_ENERGY);
             }
         } else {
             barge_in_guard_reset(&s_barge_guard);
@@ -259,32 +389,15 @@ static void detect_Task(void *arg)
             /* 检测到后不再重复触发，直到 reset() */
         }
 
-        /* ── PCM 写入 ring buffer（供 audio_in 消费）───────────
-         * AFE fetch 返回的 res->data 是 16kHz 单通道 int16_t PCM。
-         * 直接写入 ring buffer，audio_in_task 读取时无需再转换。
-         * 如果 AFE 返回多通道（res->channel > 1），取第 0 通道。
-         */
-        app_state_t current_state = app_state_get();
-        if (s_ringbuf != NULL && res->data != NULL &&
-            (current_state == APP_STATE_LISTENING || current_state == APP_STATE_PLAYING ||
-             current_state == APP_STATE_CANCELLING)) {
-            int16_t *pcm_to_buf = res->data;
-            xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-            /* During playback retain only ~0.5 s before the detected barge-in.
-             * While cancelling, retain up to ten seconds. Drop OLDEST, never
-             * keep the first echo frames from several seconds ago. */
-            size_t free_bytes = xRingbufferGetCurFreeSize(s_ringbuf);
-            size_t retain = current_state == APP_STATE_PLAYING ? 16384 : WAKE_WORD_RB_TOTAL_SIZE;
-            while (WAKE_WORD_RB_TOTAL_SIZE - free_bytes > retain ||
-                   free_bytes < s_fetch_chunksize * sizeof(int16_t) + 16) {
-                size_t bytes;
-                void *old = xRingbufferReceive(s_ringbuf, &bytes, 0);
-                if (!old) break;
-                vRingbufferReturnItem(s_ringbuf, old);
-                free_bytes = xRingbufferGetCurFreeSize(s_ringbuf);
+        /* 先保护历史并追加确认帧，再发布事件。主任务等播放锁或取消确认时仍持续录音。 */
+        uint32_t protected_id = buffer_afe_audio(res, confirm_barge_in);
+        if (protected_id) {
+            s_barge_pending = true;
+            if (event_bus_publish(EV_AUDIO_BARGE_IN, NULL, 0) != pdTRUE) {
+                s_barge_pending = false;
+                wake_word_finish_preroll(protected_id);
+                ESP_LOGW(TAG, "Barge-in event queue full; retrying detection");
             }
-            (void)xRingbufferSend(s_ringbuf, pcm_to_buf, s_fetch_chunksize * sizeof(int16_t), 0);
-            xSemaphoreGive(s_audio_buffer_lock);
         }
     }
 
@@ -508,6 +621,36 @@ RingbufHandle_t wake_word_get_ringbuf(void)
     return s_ringbuf;
 }
 
+bool wake_word_get_preroll_info(wake_word_preroll_info_t *info)
+{
+    if (!info) return false;
+    memset(info, 0, sizeof(*info));
+    if (!s_ringbuf || !s_audio_buffer_lock) return false;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    bool available = s_preroll_protected;
+    if (available) {
+        info->id = s_preroll_id;
+        info->frames = audio_buffer_frames_locked();
+        info->samples = info->frames * s_fetch_chunksize;
+    }
+    xSemaphoreGive(s_audio_buffer_lock);
+    return available;
+}
+
+size_t wake_word_finish_preroll(uint32_t id)
+{
+    if (!s_audio_buffer_lock || !id) return 0;
+    size_t dropped = 0;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    if (id == s_preroll_id && s_preroll_protected) {
+        dropped = s_preroll_dropped_samples;
+        s_preroll_protected = false;
+        s_preroll_dropped_samples = 0;
+    }
+    xSemaphoreGive(s_audio_buffer_lock);
+    return dropped;
+}
+
 int wake_word_get_chunksize(void)
 {
     return s_fetch_chunksize > 0 ? s_fetch_chunksize : 512;
@@ -541,10 +684,7 @@ void wake_word_clear_audio_buffer(void)
 {
     if (!s_ringbuf || !s_audio_buffer_lock) return;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    size_t bytes;
-    void *old;
-    while ((old = xRingbufferReceive(s_ringbuf, &bytes, 0)) != NULL)
-        vRingbufferReturnItem(s_ringbuf, old);
+    clear_audio_buffer_locked();
     xSemaphoreGive(s_audio_buffer_lock);
 }
 
@@ -608,27 +748,6 @@ uint32_t wake_word_get_detect_stack_hiwat(void)
     return s_detect_stack_hiwat;
 }
 
-/* Internal helper: drain ring buffer (NOSPLIT type, must be called with
- * tasks suspended and lock held). Same pattern as wake_word_clear_audio_buffer. */
-static void drain_ringbuf_locked(void)
-{
-    if (s_ringbuf == NULL) return;
-    size_t bytes;
-    void *item;
-    int drained = 0;
-    while ((item = xRingbufferReceive(s_ringbuf, &bytes, 0)) != NULL) {
-        vRingbufferReturnItem(s_ringbuf, item);
-        drained++;
-        if (drained > 1000) {
-            ESP_LOGW(TAG, "drain_ringbuf: stopped at 1000 items");
-            break;
-        }
-    }
-    if (drained > 0) {
-        ESP_LOGD(TAG, "drained %d ringbuf items", drained);
-    }
-}
-
 esp_err_t wake_word_set_mode(wake_word_mode_t mode)
 {
     void *target = (mode == WAKE_WORD_MODE_WAKE) ? s_afe_data_wake : s_afe_data_lite;
@@ -649,16 +768,16 @@ esp_err_t wake_word_set_mode(wake_word_mode_t mode)
              s_mode == WAKE_WORD_MODE_WAKE ? "WAKE" : "LITE",
              mode == WAKE_WORD_MODE_WAKE ? "WAKE" : "LITE");
 
-    /* Suspend both tasks; must hold buffer lock for consistent drain */
+    /* 先取缓存锁再挂起检测任务，避免把持锁的任务挂起后永远等不到锁。 */
+    if (s_audio_buffer_lock) xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     vTaskSuspend(s_feed_task_h);
     vTaskSuspend(s_detect_task_h);
-    if (s_audio_buffer_lock) xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
 
     s_afe_data = target;
     s_mode = mode;
 
     /* Drain stale PCM (old AFE output invalid for new handle) */
-    drain_ringbuf_locked();
+    clear_audio_buffer_locked();
 
     /* Reset wake detection state to prevent spurious triggers from cache */
     s_wake_state = WAKE_STATE_IDLE;

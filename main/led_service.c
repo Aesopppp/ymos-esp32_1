@@ -123,7 +123,7 @@ led_service_t led_service_init(void)
         return s_led_service;  // 已初始化
     }
 
-    /* I2C 总线初始化 — ESP-IDF v5.4 全新 master driver */
+    /* I2C 总线初始化 — ESP-IDF 6.1 master driver */
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port   = BSP_I2C_PORT,
         .sda_io_num = BSP_I2C_SDA_PIN,

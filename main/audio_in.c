@@ -3,7 +3,7 @@
  * @brief 音频采集服务 (P0 收音链路核心)
  *
  * 架构说明（唤醒词模式）：
- *  wake_word.c 的 feed_Task 通过 AFE 持续读取 I²S DMA，写入 ring buffer。
+ *  wake_word.c 的 feed_Task 持续读取 I²S DMA，detect_Task 将 AFE 输出写入 ring buffer。
  *  audio_in_start_from_ringbuf() 启动后从该 ring buffer 读取 PCM，
  *  自身不再初始化 I²S。
  *
@@ -18,6 +18,7 @@
 #include "wake_word.h"
 #include "ws_service.h"
 #include "opus_codec.h"
+#include "audio_preroll_policy.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -59,6 +60,10 @@ struct audio_in_impl {
     void                    *opus_enc;
     int16_t                  opus_pcm[320];
     size_t                   opus_samples;
+
+    /* 打断补传只统计成功发给 WebSocket 的 Opus 包，不把“读出缓存”当作上传成功。 */
+    wake_word_preroll_info_t  preroll;
+    size_t                   preroll_packets;
 
     /* 任务 */
     TaskHandle_t             task_h;
@@ -191,8 +196,31 @@ static void process_vad_frame(audio_in_handle_t h, const int16_t *pcm,
  * Opus 编码（每帧实时编码 + WS 发送）
  * ========================================================================= */
 
-static void encode_and_send(audio_in_handle_t h, const int16_t *pcm,
-                            size_t pcm_samples, uint32_t timestamp_ms)
+static void fail_audio_upload(audio_in_handle_t h, esp_err_t err)
+{
+    if (!h->running) return;
+    ESP_LOGW(TAG, "Audio upload failed: %s; requesting recovery", esp_err_to_name(err));
+    h->running = false;
+    event_bus_publish(EV_AUDIO_UPLOAD_FAILED, (void *)(uintptr_t)h->connection_generation, 0);
+}
+
+static void account_preroll_packet(audio_in_handle_t h)
+{
+    if (!h->preroll.id) return;
+    ++h->preroll_packets;
+    /* PCM 帧为 32 ms、Opus 包为 20 ms，最后一包可能同时包含缓存尾部和实时音频。
+     * 以成功发送的采样数跨过快照边界为准，不要求两种帧大小整除。
+     */
+    if (h->preroll_packets * 320u < h->preroll.samples) return;
+    size_t dropped = wake_word_finish_preroll(h->preroll.id);
+    ESP_LOGI(TAG, "Barge-in replay sent: id=%lu audio_ms=%u opus_frames=%u dropped_ms=%u",
+             (unsigned long)h->preroll.id,
+             (unsigned)audio_preroll_samples_to_ms(h->preroll.samples),
+             (unsigned)h->preroll_packets, (unsigned)audio_preroll_samples_to_ms(dropped));
+    h->preroll.id = 0;
+}
+
+static void encode_and_send(audio_in_handle_t h, const int16_t *pcm, size_t pcm_samples)
 {
     if (h->opus_enc == NULL) {
         opus_enc_config_t cfg = {
@@ -205,6 +233,7 @@ static void encode_and_send(audio_in_handle_t h, const int16_t *pcm,
         h->opus_enc = opus_enc_create(&cfg);
         if (h->opus_enc == NULL) {
             ESP_LOGW(TAG, "opus encoder create failed");
+            fail_audio_upload(h, ESP_ERR_NO_MEM);
             return;
         }
     }
@@ -217,12 +246,12 @@ static void encode_and_send(audio_in_handle_t h, const int16_t *pcm,
             int opus_len = opus_enc_encode(h->opus_enc, h->opus_pcm, sizeof(h->opus_pcm), opus_out, sizeof(opus_out));
             if (opus_len > 0) {
                 esp_err_t err = ws_service_send_opus_frame(opus_out, opus_len);
-                if (err != ESP_OK && h->running) {
-                    ESP_LOGW(TAG, "Audio upload failed: %s; requesting recovery", esp_err_to_name(err));
-                    h->running = false;
-                    event_bus_publish(EV_AUDIO_UPLOAD_FAILED,
-                        (void *)(uintptr_t)h->connection_generation, 0);
-                }
+                if (err == ESP_OK) account_preroll_packet(h);
+                else fail_audio_upload(h, err);
+            } else {
+                /* 编码失败不能跳过一句话中的采样后继续报告“完整补传”。 */
+                ESP_LOGW(TAG, "Opus encode failed: %d", opus_len);
+                fail_audio_upload(h, ESP_FAIL);
             }
             h->opus_samples = 0;
         }
@@ -241,7 +270,7 @@ static void audio_in_task(void *param)
 
     if (frame_buf == NULL) {
         ESP_LOGE(TAG, "frame_buf malloc failed");
-        h->running = false;
+        fail_audio_upload(h, ESP_ERR_NO_MEM);
         xSemaphoreGive(h->done_sem);
         vTaskDelete(NULL);
         return;
@@ -249,6 +278,13 @@ static void audio_in_task(void *param)
 
     ESP_LOGI(TAG, "audio_in task started (ringbuf, chunksize=%d, core %d)",
              wake_word_get_chunksize(), xPortGetCoreID());
+
+    h->preroll_packets = 0;
+    if (wake_word_get_preroll_info(&h->preroll)) {
+        ESP_LOGI(TAG, "Barge-in replay start: id=%lu pcm_frames=%u audio_ms=%u",
+                 (unsigned long)h->preroll.id, (unsigned)h->preroll.frames,
+                 (unsigned)audio_preroll_samples_to_ms(h->preroll.samples));
+    }
 
     while (h->running) {
         /* 从 ring buffer 读取 PCM（阻塞，最长 100ms） */
@@ -263,21 +299,35 @@ static void audio_in_task(void *param)
         size_t samples_read = item_size_out / sizeof(int16_t);
         uint32_t ts = (uint32_t)(esp_log_timestamp());
 
+        /* 先复制并归还 ring buffer 项，再编码/发送；网络阻塞时不占着环形缓存的归还位置。 */
+        if (item_size_out > item_size) {
+            vRingbufferReturnItem(h->ringbuf, buf);
+            fail_audio_upload(h, ESP_ERR_INVALID_SIZE);
+            break;
+        }
+        memcpy(frame_buf, buf, item_size_out);
+        vRingbufferReturnItem(h->ringbuf, buf);
+
         /* PCM 回调 */
         if (h->pcm_cb) {
-            h->pcm_cb(h->pcm_cb_arg, buf, item_size_out, ts);
+            h->pcm_cb(h->pcm_cb_arg, frame_buf, item_size_out, ts);
         }
 
         /* Opus 编码 + WS 发送（实时） */
-        encode_and_send(h, buf, samples_read, ts);
+        encode_and_send(h, frame_buf, samples_read);
 
         /* VAD */
-        if (h->running) process_vad_frame(h, buf, samples_read, ts);
-
-        /* 归还 buffer */
-        vRingbufferReturnItem(h->ringbuf, buf);
+        if (h->running) process_vad_frame(h, frame_buf, samples_read, ts);
     }
 
+    if (h->preroll.id) {
+        size_t dropped = wake_word_finish_preroll(h->preroll.id);
+        ESP_LOGW(TAG, "Barge-in replay incomplete: id=%lu sent_opus_frames=%u target_ms=%u dropped_ms=%u",
+                 (unsigned long)h->preroll.id, (unsigned)h->preroll_packets,
+                 (unsigned)audio_preroll_samples_to_ms(h->preroll.samples),
+                 (unsigned)audio_preroll_samples_to_ms(dropped));
+        h->preroll.id = 0;
+    }
     free(frame_buf);
     ESP_LOGI(TAG, "audio_in task exited");
     /* 通知 audio_in_stop() 任务已退出；不能使用 xTaskNotifyGive(NULL)，

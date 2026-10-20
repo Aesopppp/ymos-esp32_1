@@ -42,6 +42,11 @@ idf_component_register(
         mbedtls
         mqtt
         esp_http_server
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_uart
+        esp_ringbuf
 )
 
 # Suppress warnings from IDF headers in third-party code
