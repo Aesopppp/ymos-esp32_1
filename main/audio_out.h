@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include "esp_err.h"
 #include "driver/i2s_std.h"
+#define AUDIO_OUT_DEFAULT_VOLUME 40
 #define AUDIO_OUT_SAMPLE_RATE 16000
 #define AUDIO_OUT_BIT_WIDTH 16
 #define AUDIO_OUT_CHANNELS 1
@@ -24,6 +25,9 @@ typedef void (*audio_out_event_cb_t)(audio_out_event_type_t ev, void *user_data)
 
 esp_err_t audio_out_init(uint8_t i2c_addr);
 esp_err_t audio_out_deinit(void);
+/* 主任务调用，百分比 0..100；只设置硬件/RAM，不写 NVS。与 PCM 输出串行。 */
+esp_err_t audio_out_set_volume(int volume);
+int audio_out_get_volume(void);
 esp_err_t audio_out_read_microphones(int16_t *pcm, size_t bytes);
 /* Software reference follows submitted I2S blocks, including silence. Compensates
  * the configured DMA horizon; physical/acoustic alignment needs board testing. */

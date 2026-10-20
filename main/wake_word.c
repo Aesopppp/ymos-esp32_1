@@ -621,6 +621,21 @@ RingbufHandle_t wake_word_get_ringbuf(void)
     return s_ringbuf;
 }
 
+void wake_word_protect_preroll(void)
+{
+    if (!s_ringbuf || !s_audio_buffer_lock) return;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    if (!s_preroll_protected && app_state_get() == APP_STATE_PLAYING) {
+        s_preroll_protected = true;
+        if (++s_preroll_id == 0) ++s_preroll_id;
+        s_preroll_dropped_samples = 0;
+    }
+    size_t frames = audio_buffer_frames_locked();
+    xSemaphoreGive(s_audio_buffer_lock);
+    ESP_LOGI(TAG, "Manual interrupt pre-roll: frames=%u audio_ms=%u",
+             (unsigned)frames, (unsigned)audio_preroll_samples_to_ms(frames * s_fetch_chunksize));
+}
+
 bool wake_word_get_preroll_info(wake_word_preroll_info_t *info)
 {
     if (!info) return false;

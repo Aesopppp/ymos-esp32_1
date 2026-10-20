@@ -53,6 +53,12 @@ typedef enum {
     EV_MQTT_COMMAND          = 53,
     EV_PROVISIONING_DONE    = 54,
     EV_PROVISIONING_TIMEOUT  = 55,
+    /* ADC 按键只发动作，无借用 payload；主任务串行执行所有业务。 */
+    EV_BUTTON_VOLUME_DOWN   = 60,
+    EV_BUTTON_VOLUME_UP     = 61,
+    EV_BUTTON_TALK          = 62,
+    EV_BUTTON_END_TALK      = 63,
+    EV_BUTTON_PROVISION     = 64,
 } app_event_id_t;
 
 #define EV_SYSTEM_WIFI_DISCONNECTED EV_WIFI_DISCONNECTED

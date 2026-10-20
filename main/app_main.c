@@ -46,6 +46,8 @@
 #include "wake_word.h"
 #include "mqtt_service.h"
 #include "provisioning_service.h"
+#include "button_service.h"
+#include "button_policy.h"
 #include "cJSON.h"
 
 static const char *TAG = "app_main";
@@ -54,6 +56,8 @@ static const char *TAG = "app_main";
 
 static event_bus_t s_bus;
 static led_service_t s_led;
+static int s_saved_volume;
+static int64_t s_volume_save_at_ms;
 
 
 #define MAIN_TASK_PRIORITY   5
@@ -85,7 +89,11 @@ static esp_err_t system_init(void)
     }
 
     ESP_ERROR_CHECK(audio_out_init(ES8311_I2C_ADDR));
-    ESP_LOGI(TAG, "Audio output ready");
+    int volume = cfg_service_get_int(CFG_KEY_VOLUME, AUDIO_OUT_DEFAULT_VOLUME);
+    if (volume < 0 || volume > 100) volume = AUDIO_OUT_DEFAULT_VOLUME;
+    ESP_ERROR_CHECK(audio_out_set_volume(volume));
+    s_saved_volume = volume;
+    ESP_LOGI(TAG, "Audio output ready (volume=%d)", volume);
 
 
     ESP_ERROR_CHECK(ws_service_init());
@@ -96,6 +104,10 @@ static esp_err_t system_init(void)
     if (!audio_in_create(&input_config)) return ESP_ERR_NO_MEM;
     ESP_ERROR_CHECK(wake_word_init());
     ESP_LOGI(TAG, "WebSocket service ready");
+    esp_err_t button_err = button_service_init();
+    if (button_err != ESP_OK) {
+        ESP_LOGW(TAG, "Buttons unavailable: %s", esp_err_to_name(button_err));
+    }
 
     return ESP_OK;
 }
@@ -104,15 +116,36 @@ static esp_err_t system_init(void)
 
 /* Only this task changes session state or starts/stops the WS client. */
 static bool conversation_active;
-static bool intentional_disconnect; /* set when 60s silence or other user-driven teardown; suppresses auto-reconnect */
+/* 主任务拥有。结束对话/进入配网先清除此意图，迟到的错误不得重新拉起会话。 */
+static bool session_requested;
 static int64_t retry_at_ms, auth_deadline_ms, cancel_deadline_ms, response_deadline_ms;
 static int64_t resume_deadline_ms;
 static int64_t cancel_probe_ms;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
+static void end_conversation(const char *reason)
+{
+    session_requested = conversation_active = false;
+    retry_at_ms = auth_deadline_ms = cancel_deadline_ms = response_deadline_ms = 0;
+    resume_deadline_ms = cancel_probe_ms = 0;
+    /* 先停上传/播放，再启用 WakeNet，避免结束时把自己的尾音当成新唤醒。 */
+    app_state_pause_silence_timer();
+    esp_err_t input_err = audio_in_stop(audio_in_get_handle());
+    if (input_err != ESP_OK) ESP_LOGW(TAG, "Audio stop failed: %s", esp_err_to_name(input_err));
+    esp_err_t err = ws_service_disconnect();
+    if (err != ESP_OK) ESP_LOGW(TAG, "WS stop failed: %s", esp_err_to_name(err));
+    app_state_back_to_wait_wake(false);
+    wake_word_reset_barge_in();
+    wake_word_clear_audio_buffer();
+    if (wifi_service_get_state() == WIFI_STATE_GOT_IP) led_set_waiting_wake();
+    else led_set_wifi_err();
+    ESP_LOGI(TAG, "Conversation ended: %s; waiting for wake word or REC", reason);
+}
+
 static void recover_session(const char *reason)
 {
+    if (!session_requested || provisioning_service_is_active()) return;
     ESP_LOGW(TAG, "Session recovery: %s", reason);
     if (conversation_active && !resume_deadline_ms) resume_deadline_ms = now_ms() + 60000;
     app_state_back_to_wait_wake(false);
@@ -139,8 +172,7 @@ static void resume_listening(bool keep_buffered_speech, const char *reason)
     }
     wake_word_reset_barge_in();
 
-    /* POC-2 fix: ensure AFE is in LITE mode for audio upload. */
-    /* Covers all 5 callers: wake + reconnect + barge-in + reply. */
+    /* 唤醒、按键、重连、取消和正常回复统一保证上传时使用 LITE 模式。 */
     if (wake_word_get_mode() != WAKE_WORD_MODE_LITE) {
         if (wake_word_set_mode(WAKE_WORD_MODE_LITE) == ESP_OK) {
             ESP_LOGI(TAG, "AFE mode -> LITE (WakeNet disabled for audio)");
@@ -149,6 +181,132 @@ static void resume_listening(bool keep_buffered_speech, const char *reason)
     resume_deadline_ms = 0;
     led_set_listening();
     ESP_LOGI(TAG, "Conversation listening; source=%s; ready for the next question", reason);
+}
+
+/* 唤醒词和 REC 共用入口：待机不上传，认证成功后才开始监听。 */
+static void start_conversation(const char *reason)
+{
+    if (provisioning_service_is_active()) {
+        wake_word_reset();
+        ESP_LOGI(TAG, "Talk ignored during Wi-Fi setup");
+        return;
+    }
+    if (wifi_service_get_state() != WIFI_STATE_GOT_IP) {
+        wake_word_reset();
+        led_set_wifi_err();
+        ESP_LOGW(TAG, "Talk ignored: Wi-Fi not ready");
+        return;
+    }
+    if (session_requested) {
+        if (app_state_get() == APP_STATE_LISTENING) app_state_reset_silence_timer();
+        return; /* 连接中/取消中重复按键不重复发送请求。 */
+    }
+    session_requested = true;
+    wake_word_set_mode(WAKE_WORD_MODE_LITE);
+    if (ws_service_get_state() == WS_STATE_CONNECTED) {
+        conversation_active = true;
+        resume_listening(false, reason);
+    } else {
+        app_state_set(APP_STATE_WS_CONNECTING_WAKE);
+        retry_at_ms = now_ms();
+        led_set_connecting();
+        ESP_LOGI(TAG, "Conversation requested: %s; opening WebSocket", reason);
+    }
+}
+
+/* 手动/语音打断共用取消边界；只在主任务操作 WS，保留已有预录音补传逻辑。 */
+static void interrupt_response(bool manual)
+{
+    if (!conversation_active || app_state_get() != APP_STATE_PLAYING ||
+        ws_service_get_state() != WS_STATE_CONNECTED) return;
+    if (manual) wake_word_protect_preroll();
+    esp_err_t err = ws_service_cancel_response();
+    if (err == ESP_ERR_NOT_FOUND) {
+        /* 回答恰好结束，队列内的正常完成事件负责恢复监听。 */
+        wake_word_reset_barge_in();
+        return;
+    }
+    if (err != ESP_OK) { recover_session("response.cancel send failed"); return; }
+    app_state_set(APP_STATE_CANCELLING);
+    app_state_pause_silence_timer();
+    response_deadline_ms = 0;
+    cancel_probe_ms = now_ms() + 3000;
+    cancel_deadline_ms = now_ms() + 8000;
+    ESP_LOGI(TAG, "Playback stopped (%s); waiting for cancelled reply boundary",
+             manual ? "REC" : "voice");
+}
+
+static esp_err_t start_saved_wifi(void)
+{
+    char ssid[33], password[65];
+    cfg_get_wifi_credential(ssid, sizeof(ssid), password, sizeof(password));
+    if (!ssid[0]) return ESP_ERR_NOT_FOUND;
+    esp_err_t err = wifi_service_start(ssid, password);
+    if (err != ESP_OK) ESP_LOGW(TAG, "Wi-Fi start failed: %s", esp_err_to_name(err));
+    return err;
+}
+
+static void enter_provisioning(const char *reason)
+{
+    if (provisioning_service_is_active()) return;
+    end_conversation(reason);
+    (void)mqtt_service_stop();
+    esp_err_t err = provisioning_service_start();
+    if (err == ESP_OK) {
+        app_state_set(APP_STATE_PROVISIONING);
+        led_set_connecting();
+        ESP_LOGI(TAG, "Wi-Fi setup active; hold SET for 3s to leave");
+    } else {
+        ESP_LOGE(TAG, "Wi-Fi setup failed: %s", esp_err_to_name(err));
+        (void)start_saved_wifi();
+    }
+}
+
+static void leave_provisioning(const char *reason)
+{
+    if (!provisioning_service_is_active()) return;
+    esp_err_t err = provisioning_service_stop();
+    app_state_back_to_wait_wake(false);
+    led_set_wifi_err();
+    ESP_LOGI(TAG, "Wi-Fi setup closed: %s; reconnecting saved network", reason);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi setup stop failed: %s", esp_err_to_name(err));
+        return;
+    }
+    if (start_saved_wifi() == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "No saved network; hold SET for 3s to configure Wi-Fi");
+    }
+}
+
+static void change_volume(bool increase)
+{
+    int current = audio_out_get_volume();
+    int next = button_volume_next(current, increase);
+    if (next == current) return;
+    esp_err_t err = audio_out_set_volume(next);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Volume change failed: %s", esp_err_to_name(err));
+        return;
+    }
+    /* 连按只修改 RAM/Codec，停止调节 1.5 秒后合并写一次 NVS。 */
+    s_volume_save_at_ms = now_ms() + 1500;
+    ESP_LOGI(TAG, "Volume: %d -> %d", current, next);
+}
+
+static void save_volume_if_due(int64_t now)
+{
+    if (!s_volume_save_at_ms || now < s_volume_save_at_ms) return;
+    int volume = audio_out_get_volume();
+    if (volume == s_saved_volume) { s_volume_save_at_ms = 0; return; }
+    esp_err_t err = cfg_service_set_int(CFG_KEY_VOLUME, volume);
+    if (err == ESP_OK) {
+        s_saved_volume = volume;
+        s_volume_save_at_ms = 0;
+        ESP_LOGI(TAG, "Volume saved: %d", volume);
+    } else {
+        s_volume_save_at_ms = now + 5000;
+        ESP_LOGW(TAG, "Volume save failed; retry in 5s: %s", esp_err_to_name(err));
+    }
 }
 
 static bool tagged_ws_event(event_type_t id)
@@ -168,75 +326,75 @@ static void main_task(void *arg)
              (unsigned long)esp_random(), esp_reset_reason());
     app_state_set(APP_STATE_WAIT_WAKE);
     led_set_wifi_err();
-    char ssid[33], password[65];
-    cfg_get_wifi_credential(ssid, sizeof(ssid), password, sizeof(password));
-    if (ssid[0] == '\0') {
-        app_state_set(APP_STATE_PROVISIONING);
-        provisioning_service_start();
-    } else {
-        wifi_service_start(ssid, password);
-    }
+    if (start_saved_wifi() != ESP_OK) enter_provisioning("no usable Wi-Fi configuration");
 
     while (1) {
         event_t event;
         if (event_bus_receive(s_bus, &event, pdMS_TO_TICKS(20)) == pdTRUE) {
             if (tagged_ws_event(event.type) &&
-                (uint32_t)(uintptr_t)event.payload != ws_service_generation()) continue;
+                ((uint32_t)(uintptr_t)event.payload != ws_service_generation() ||
+                 !session_requested)) continue;
             app_state_t current_state = app_state_get();
             switch (event.type) {
             case EV_WIFI_GOT_IP:
+                if (provisioning_service_is_active() || wifi_service_get_state() != WIFI_STATE_GOT_IP) break;
+                provisioning_service_confirm();
                 if (!mqtt_service_is_connected()) {
                     esp_err_t mqtt_err = mqtt_service_start();
                     if (mqtt_err != ESP_OK) ESP_LOGW(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_err));
                 }
-                /* Wake-deferred flow: Wi-Fi ready does NOT auto-open WebSocket. */
-                /* Device stays in WAIT_WAKE; WS will be opened on wake word. */
-                ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word before connecting");
-                intentional_disconnect = false;
-                retry_at_ms = 0;
-                auth_deadline_ms = 0;
-                app_state_back_to_wait_wake(false);
-                led_set_waiting_wake();
-
+                /* 普通联网不打开 WS；重复 IP 事件不能打断正在进行的对话。 */
+                if (!session_requested) {
+                    ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word or REC before connecting");
+                    app_state_back_to_wait_wake(false);
+                    led_set_waiting_wake();
+                }
                 break;
             case EV_PROVISIONING_DONE:
-                provisioning_service_stop();
-                cfg_get_wifi_credential(ssid, sizeof(ssid), password, sizeof(password));
-                wifi_service_start(ssid, password);
+                if ((uint32_t)(uintptr_t)event.payload == provisioning_service_generation())
+                    leave_provisioning("credentials submitted");
                 break;
             case EV_PROVISIONING_TIMEOUT:
-                ESP_LOGW(TAG, "Provisioning timeout; leaving config mode");
-                provisioning_service_stop();
+                if (provisioning_service_is_active() && provisioning_service_timed_out())
+                    leave_provisioning("10-minute timeout");
                 break;
             case EV_MQTT_COMMAND: {
                 const char *json = (const char *)event.payload;
-                cJSON *root = cJSON_Parse(json);
+                cJSON *root = json ? cJSON_Parse(json) : NULL;
                 cJSON *type = root ? cJSON_GetObjectItem(root, "type") : NULL;
-                if (cJSON_IsString(type) && strcmp(type->valuestring, "enter_provisioning") == 0) {
-                    (void)mqtt_service_stop();
-                    provisioning_service_start();
-                    app_state_set(APP_STATE_PROVISIONING);
-                }
+                if (cJSON_IsString(type) && strcmp(type->valuestring, "enter_provisioning") == 0)
+                    enter_provisioning("MQTT command");
                 if (root) cJSON_Delete(root);
                 break;
             }
             case EV_WIFI_DISCONNECTED:
             case EV_WIFI_CONNECT_FAILED:
+                /* 配网时以及已经恢复 IP 时，忽略队列中迟到的断线通知。 */
+                if (provisioning_service_is_active() || wifi_service_get_state() == WIFI_STATE_GOT_IP ||
+                    wifi_service_get_state() == WIFI_STATE_IDLE) break;
+                if (event.type == EV_WIFI_CONNECT_FAILED && wifi_service_get_state() != WIFI_STATE_FAIL) break;
                 (void)mqtt_service_stop();
                 if (event.type == EV_WIFI_CONNECT_FAILED) {
                     provisioning_service_rollback();
-                    provisioning_service_start();
-                    app_state_set(APP_STATE_PROVISIONING);
+                    enter_provisioning("Wi-Fi connection failed");
+                } else {
+                    end_conversation("Wi-Fi disconnected");
                 }
-                /* Wake-deferred flow: no auto-reconnect. Just back to WAIT_WAKE. */
-                /* Wi-Fi service keeps retrying on its own; once it recovers, EV_WIFI_GOT_IP fires. */
-                retry_at_ms = 0;
-                auth_deadline_ms = 0;
-                intentional_disconnect = false;
-                app_state_back_to_wait_wake(false);
-                led_set_wifi_err();
                 break;
-                led_set_wifi_err();
+            case EV_BUTTON_VOLUME_DOWN:
+            case EV_BUTTON_VOLUME_UP:
+                change_volume(event.type == EV_BUTTON_VOLUME_UP);
+                break;
+            case EV_BUTTON_TALK:
+                if (current_state == APP_STATE_PLAYING) interrupt_response(true);
+                else start_conversation("REC button");
+                break;
+            case EV_BUTTON_END_TALK:
+                if (!provisioning_service_is_active()) end_conversation("REC held for 2s");
+                break;
+            case EV_BUTTON_PROVISION:
+                if (provisioning_service_is_active()) leave_provisioning("SET held for 3s");
+                else enter_provisioning("SET held for 3s");
                 break;
             case EV_WS_CONNECTED:
                 ESP_LOGI(TAG, "WebSocket transport connected; authenticating");
@@ -246,29 +404,10 @@ static void main_task(void *arg)
             case EV_WS_AUTH_OK:
                 auth_deadline_ms = retry_at_ms = 0;
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
-                if (current_state == APP_STATE_WS_CONNECTING_WAKE) {
-                    /* Wake-deferred flow: auth completed after wake word. */
-                    /* Immediately resume listening so the user can speak. */
-                    conversation_active = true;
-                    resume_listening(false, "wake word connect complete");
-                } else if (conversation_active && resume_deadline_ms && now_ms() < resume_deadline_ms) {
-                    resume_listening(false, "reconnect of previously awakened conversation");
-                } else {
-                    conversation_active = false;
-                    resume_deadline_ms = 0;
-                    wake_word_reset();
-                    led_set_waiting_wake();
-                    ESP_LOGI(TAG, "Online; WAIT_WAKE; microphone upload off until wake word");
-                }
+                conversation_active = true;
+                resume_listening(false, resume_deadline_ms ? "reconnect" : "wake/REC connect complete");
                 break;
             case EV_WS_DISCONNECTED:
-                /* User-initiated (silence timeout) disconnects should not trigger */
-                /* session recovery / auto-reconnect. */
-                if (intentional_disconnect) {
-                    intentional_disconnect = false;
-                    ESP_LOGI(TAG, "WebSocket intentionally disconnected (returning to WAIT_WAKE)");
-                    break;
-                }
                 recover_session("WebSocket transport disconnected");
                 break;
             case EV_WS_ERROR:
@@ -281,34 +420,7 @@ static void main_task(void *arg)
                 recover_session("audio upload failed");
                 break;
             case EV_AUDIO_WAKE_DETECTED:
-                /* Wake-deferred flow: this is the trigger point for WebSocket connect. */
-                if (wifi_service_get_state() != WIFI_STATE_GOT_IP) {
-                    ESP_LOGW(TAG, "Wake ignored: Wi-Fi not ready");
-                    wake_word_reset();
-                    led_set_wifi_err();
-                    break;
-                }
-                if (ws_service_get_state() != WS_STATE_CONNECTED) {
-                    /* Schedule immediate WebSocket connect + auth; LED shows connecting. */
-                    ESP_LOGI(TAG, "Wake detected; opening WebSocket ...");
-                    app_state_set(APP_STATE_WS_CONNECTING_WAKE);
-                    /* POC-2: 切到 LITE 模式(无 WakeNet),节省 LISTENING/PLAYING 期间 CPU */
-                    if (wake_word_set_mode(WAKE_WORD_MODE_LITE) == ESP_OK) {
-                        ESP_LOGI(TAG, "AFE mode -> LITE (WakeNet disabled for CPU savings)");
-                    }
-                    intentional_disconnect = false;
-                    retry_at_ms = now_ms();
-                    auth_deadline_ms = now_ms() + 10000;
-                    led_set_connecting();
-                    break;
-                }
-                /* WS already connected (race: user woke while we were reconnecting). */
-                /* POC-2: WS already connected, switch to LITE for audio */
-                wake_word_set_mode(WAKE_WORD_MODE_LITE);
-                if (!conversation_active) {
-                    conversation_active = true;
-                    resume_listening(false, "wake word");
-                }
+                start_conversation("wake word");
                 break;
             case EV_AUDIO_SPEECH_START:
             case EV_WS_SPEECH_STARTED:
@@ -333,25 +445,9 @@ static void main_task(void *arg)
                     led_set_speaking();
                 }
                 break;
-            case EV_AUDIO_BARGE_IN: {
-                if (!conversation_active || current_state != APP_STATE_PLAYING ||
-                    ws_service_get_state() != WS_STATE_CONNECTED) break;
-                esp_err_t err = ws_service_cancel_response();
-                if (err == ESP_ERR_NOT_FOUND) {
-                    /* Reply finished just before this queued VAD event. Its
-                     * normal completion event will resume listening once. */
-                    wake_word_reset_barge_in();
-                    break;
-                }
-                if (err != ESP_OK) { recover_session("response.cancel send failed"); break; }
-                app_state_set(APP_STATE_CANCELLING);
-                app_state_pause_silence_timer();
-                response_deadline_ms = 0;
-                cancel_probe_ms = now_ms() + 3000;
-                cancel_deadline_ms = now_ms() + 8000;
-                ESP_LOGI(TAG, "Playback stopped; waiting for cancelled reply boundary");
+            case EV_AUDIO_BARGE_IN:
+                interrupt_response(false);
                 break;
-            }
             case EV_WS_CANCEL_DONE:
                 if (conversation_active && current_state == APP_STATE_CANCELLING) {
                     ESP_LOGI(TAG, "Cancel acknowledged; resume buffered microphone audio");
@@ -368,23 +464,7 @@ static void main_task(void *arg)
                 /* Ignore an already queued timeout from before playback. */
                 if (current_state != APP_STATE_LISTENING) break;
                 if (esp_timer_is_active(app_state_get_global()->silence_timer)) break;
-                conversation_active = false;
-                resume_deadline_ms = 0;
-                /* Tear down WebSocket so the device is fully idle until next wake. */
-                if (ws_service_get_state() == WS_STATE_CONNECTED) {
-                    intentional_disconnect = true;
-                    esp_err_t err = ws_service_disconnect();
-                    if (err != ESP_OK) {
-                        ESP_LOGW(TAG, "WS disconnect on silence timeout failed: %s", esp_err_to_name(err));
-                        intentional_disconnect = false;
-                    } else {
-                        ESP_LOGI(TAG, "60s silence: closing WebSocket for full idle");
-                    }
-                }
-                retry_at_ms = 0;
-                app_state_back_to_wait_wake(true);
-                wake_word_clear_audio_buffer();
-                led_set_waiting_wake();
+                end_conversation("60s silence timeout");
                 break;
             case EV_AUDIO_INPUT_ERROR:
                 recover_session("audio input error");
@@ -393,15 +473,14 @@ static void main_task(void *arg)
             }
         }
         int64_t now = now_ms();
+        save_volume_if_due(now);
         if (cancel_probe_ms && now >= cancel_probe_ms) {
             cancel_probe_ms = 0;
             ESP_LOGW(TAG, "Cancel confirmation delayed; keeping connection while waiting (limit 8 s)");
             ws_service_log_cancel_wait();
         }
         if (resume_deadline_ms && now >= resume_deadline_ms) {
-            conversation_active = false;
-            resume_deadline_ms = 0;
-            wake_word_reset();
+            end_conversation("conversation recovery expired");
         }
         if (cancel_deadline_ms && now >= cancel_deadline_ms) {
             ws_service_log_cancel_wait();
@@ -411,8 +490,9 @@ static void main_task(void *arg)
             recover_session("server reply timed out");
         else if (auth_deadline_ms && now >= auth_deadline_ms)
             recover_session("connection/authentication timed out");
-        if (retry_at_ms && now >= retry_at_ms && wifi_service_get_state() == WIFI_STATE_GOT_IP) {
-                ESP_LOGI(TAG, "Connecting WebSocket (wake-triggered or retry) ...");
+        if (session_requested && retry_at_ms && now >= retry_at_ms &&
+            wifi_service_get_state() == WIFI_STATE_GOT_IP && !provisioning_service_is_active()) {
+            ESP_LOGI(TAG, "Connecting WebSocket (wake-triggered or retry) ...");
             /* Stop is idempotent, and retries a prior failed stop before start. */
             esp_err_t err = ws_service_disconnect();
             if (err == ESP_OK) err = ws_service_connect();

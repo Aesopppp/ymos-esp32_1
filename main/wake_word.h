@@ -118,6 +118,9 @@ typedef struct {
 /** 仅由 audio_in 在开始读 ring buffer 前调用，获取本次需补传的 FIFO 前缀。 */
 bool wake_word_get_preroll_info(wake_word_preroll_info_t *info);
 
+/** 主任务手动打断前调用；在同一缓存锁下保护历史，沿用语音打断的补传流程。 */
+void wake_word_protect_preroll(void);
+
 /** 补传完成或中止时解除对应批次保护，返回保护期间因容量不足丢弃的新采样数。 */
 size_t wake_word_finish_preroll(uint32_t id);
 
