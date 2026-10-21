@@ -7,6 +7,7 @@
 #include "led_service.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 #include "esp_netif_types.h"
@@ -33,25 +34,36 @@ static const char *TAG = "wifi_service";
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static wifi_state_t s_wifi_state = WIFI_STATE_IDLE;
 static SemaphoreHandle_t s_mutex = NULL;
+/* 主动停止/AP 配网期间禁止 STA_START 和断线事件自动重连。 */
+static atomic_bool s_connect_enabled;
 static esp_timer_handle_t s_connect_timer = NULL;
+static int64_t s_connect_deadline_us; /* 与 start/stop/事件处理共用递归互斥锁。 */
 #define WIFI_CONNECT_TIMEOUT_MS 60000
 static wifi_state_t get_state(void);
 static void set_state(wifi_state_t st);
+static void lock(void);
+static void unlock(void);
 
 static void wifi_connect_timeout(void *arg)
 {
     (void)arg;
-    if (get_state() == WIFI_STATE_CONNECTING) {
+    lock();
+    /* 已排队的旧回调不能中止刚开始的新一轮连接。 */
+    if (s_connect_deadline_us && esp_timer_get_time() >= s_connect_deadline_us &&
+        atomic_exchange(&s_connect_enabled, false)) {
+        s_connect_deadline_us = 0;
         ESP_LOGW(TAG, "Wi-Fi connection timeout after %d ms", WIFI_CONNECT_TIMEOUT_MS);
         esp_wifi_disconnect();
+        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         set_state(WIFI_STATE_FAIL);
     }
+    unlock();
 }
 
 /* ── 工具 ─────────────────────────────────────────────────────────────────── */
 
-static void lock(void)   { xSemaphoreTake(s_mutex, portMAX_DELAY); }
-static void unlock(void) { xSemaphoreGive(s_mutex); }
+static void lock(void)   { xSemaphoreTakeRecursive(s_mutex, portMAX_DELAY); }
+static void unlock(void) { xSemaphoreGiveRecursive(s_mutex); }
 
 static void set_state(wifi_state_t st)
 {
@@ -81,7 +93,9 @@ static wifi_state_t get_state(void)
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    if (strcmp(event_base, WIFI_EVENT) == 0) {
+    lock();
+    if (!atomic_load(&s_connect_enabled)) { unlock(); return; }
+    if (event_base == WIFI_EVENT) {
         switch (event_id) {
             case WIFI_EVENT_STA_START:
                 ESP_LOGI(TAG, "STA started, initiating connection");
@@ -101,7 +115,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 wifi_event_sta_disconnected_t *ev =
                     (wifi_event_sta_disconnected_t *)event_data;
                 ESP_LOGW(TAG, "Disconnected: reason=%d; retrying", ev->reason);
+                xEventGroupClearBits(s_wifi_event_group, WIFI_GOT_IP_BIT);
                 set_state(WIFI_STATE_DISCONNECTED);
+                if (!esp_timer_is_active(s_connect_timer)) {
+                    s_connect_deadline_us = esp_timer_get_time() + WIFI_CONNECT_TIMEOUT_MS * 1000ULL;
+                    esp_timer_start_once(s_connect_timer, WIFI_CONNECT_TIMEOUT_MS * 1000ULL);
+                }
                 esp_err_t retry_err = esp_wifi_connect();
                 if (retry_err != ESP_OK && retry_err != ESP_ERR_WIFI_CONN) {
                     ESP_LOGW(TAG, "Reconnect failed: %s", esp_err_to_name(retry_err));
@@ -112,12 +131,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             default:
                 break;
         }
-    } else if (strcmp(event_base, IP_EVENT) == 0) {
+    } else if (event_base == IP_EVENT) {
         switch (event_id) {
             case IP_EVENT_STA_GOT_IP: {
                 ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
                 ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
                 set_state(WIFI_STATE_GOT_IP);
+                s_connect_deadline_us = 0;
                 if (s_connect_timer) esp_timer_stop(s_connect_timer);
                 led_set_wifi_ok();
                 xEventGroupSetBits(s_wifi_event_group, WIFI_GOT_IP_BIT);
@@ -125,19 +145,25 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             }
             case IP_EVENT_STA_LOST_IP:
                 ESP_LOGW(TAG, "Lost IP");
-                set_state(WIFI_STATE_CONNECTED);
+                xEventGroupClearBits(s_wifi_event_group, WIFI_GOT_IP_BIT);
+                set_state(WIFI_STATE_DISCONNECTED);
+                if (!esp_timer_is_active(s_connect_timer)) {
+                    s_connect_deadline_us = esp_timer_get_time() + WIFI_CONNECT_TIMEOUT_MS * 1000ULL;
+                    esp_timer_start_once(s_connect_timer, WIFI_CONNECT_TIMEOUT_MS * 1000ULL);
+                }
                 break;
             default:
                 break;
         }
     }
+    unlock();
 }
 
 /* ── 公开 API ─────────────────────────────────────────────────────────────── */
 
 esp_err_t wifi_service_init(void)
 {
-    s_mutex = xSemaphoreCreateMutex();
+    s_mutex = xSemaphoreCreateRecursiveMutex();
     if (!s_mutex) return ESP_FAIL;
 
     s_wifi_event_group = xEventGroupCreate();
@@ -177,111 +203,66 @@ esp_err_t wifi_service_init(void)
 esp_err_t wifi_service_connect(const char *ssid, const char *password,
                                 uint32_t timeout_ms)
 {
-    if (!ssid) return ESP_ERR_INVALID_ARG;
-
-    set_state(WIFI_STATE_CONNECTING);
-
-    wifi_config_t wifi_cfg = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_OPEN,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
-        },
-    };
-
-    size_t ssid_len = strlen(ssid);
-    if (ssid_len >= sizeof(wifi_cfg.sta.ssid)) {
-        ssid_len = sizeof(wifi_cfg.sta.ssid) - 1;
-    }
-    memcpy(wifi_cfg.sta.ssid, ssid, ssid_len);
-    wifi_cfg.sta.ssid[ssid_len] = '\0';
-
-    if (password && strlen(password) > 0) {
-        size_t pw_len = strlen(password);
-        if (pw_len >= sizeof(wifi_cfg.sta.password)) {
-            pw_len = sizeof(wifi_cfg.sta.password) - 1;
-        }
-        memcpy(wifi_cfg.sta.password, password, pw_len);
-        wifi_cfg.sta.password[pw_len] = '\0';
-        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Wi-Fi connecting to SSID='%s'...", ssid);
-
-    /* 等待 GOT_IP 或 FAIL */
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group,
-        WIFI_GOT_IP_BIT | WIFI_FAIL_BIT,
-        pdFALSE,    /* 不清除所有位 */
-        pdFALSE,    /* 不等待所有位 */
-        pdMS_TO_TICKS(timeout_ms)
-    );
-
-    if (bits & WIFI_GOT_IP_BIT) {
-        set_state(WIFI_STATE_GOT_IP);
-        return ESP_OK;
-    } else {
-        set_state(WIFI_STATE_FAIL);
-        ESP_LOGE(TAG, "Wi-Fi connect timeout or failed");
-        return ESP_FAIL;
-    }
+    esp_err_t err = wifi_service_start(ssid, password);
+    if (err != ESP_OK) return err;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+        WIFI_GOT_IP_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    if (bits & WIFI_GOT_IP_BIT) return ESP_OK;
+    wifi_service_disconnect();
+    return bits & WIFI_FAIL_BIT ? ESP_FAIL : ESP_ERR_TIMEOUT;
 }
 
-void wifi_service_start(const char *ssid, const char *password)
+esp_err_t wifi_service_start(const char *ssid, const char *password)
 {
-    if (!ssid) return;
-
-    wifi_service_disconnect();   /* 确保干净状态 */
-
-    wifi_config_t wifi_cfg = {
+    if (!ssid || !ssid[0] || strlen(ssid) > 32 ||
+        (password && strlen(password) > 64)) return ESP_ERR_INVALID_ARG;
+    lock();
+    esp_err_t err = wifi_service_disconnect();
+    if (err != ESP_OK) { unlock(); return err; }
+    wifi_config_t config = {
         .sta = {
             .threshold.authmode = WIFI_AUTH_OPEN,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
+            .pmf_cfg = {.capable = true, .required = false},
         },
     };
-
-    size_t ssid_len = strlen(ssid);
-    if (ssid_len >= sizeof(wifi_cfg.sta.ssid)) {
-        ssid_len = sizeof(wifi_cfg.sta.ssid) - 1;
+    /* ESP-IDF 的这两个数组允许恰好 32/64 字节，不强行截掉最后一字节。 */
+    memcpy(config.sta.ssid, ssid, strlen(ssid));
+    if (password && password[0]) {
+        memcpy(config.sta.password, password, strlen(password));
+        config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     }
-    memcpy(wifi_cfg.sta.ssid, ssid, ssid_len);
-    wifi_cfg.sta.ssid[ssid_len] = '\0';
-
-    if (password && strlen(password) > 0) {
-        size_t pw_len = strlen(password);
-        if (pw_len >= sizeof(wifi_cfg.sta.password)) {
-            pw_len = sizeof(wifi_cfg.sta.password) - 1;
-        }
-        memcpy(wifi_cfg.sta.password, password, pw_len);
-        wifi_cfg.sta.password[pw_len] = '\0';
-        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    }
-
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (err != ESP_OK) { unlock(); return err; }
+    xEventGroupClearBits(s_wifi_event_group, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
     set_state(WIFI_STATE_CONNECTING);
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    if (s_connect_timer) {
-        esp_timer_stop(s_connect_timer);
-        ESP_ERROR_CHECK(esp_timer_start_once(s_connect_timer, WIFI_CONNECT_TIMEOUT_MS * 1000ULL));
+    atomic_store(&s_connect_enabled, true);
+    s_connect_deadline_us = esp_timer_get_time() + WIFI_CONNECT_TIMEOUT_MS * 1000ULL;
+    err = esp_timer_start_once(s_connect_timer, WIFI_CONNECT_TIMEOUT_MS * 1000ULL);
+    if (err == ESP_OK) err = esp_wifi_start();
+    if (err != ESP_OK) {
+        wifi_service_disconnect();
+        set_state(WIFI_STATE_FAIL);
+        unlock();
+        return err;
     }
-
-    ESP_LOGI(TAG, "Wi-Fi connecting to SSID='%s' (async)...", ssid);
+    ESP_LOGI(TAG, "Wi-Fi connection started (timeout=%d ms)", WIFI_CONNECT_TIMEOUT_MS);
+    unlock();
+    return ESP_OK;
 }
 
 esp_err_t wifi_service_disconnect(void)
 {
-    esp_err_t err = esp_wifi_disconnect();
-    if (err == ESP_OK || err == ESP_ERR_WIFI_NOT_STARTED) {
-        set_state(WIFI_STATE_DISCONNECTED);
-    }
+    lock();
+    s_connect_deadline_us = 0;
+    atomic_store(&s_connect_enabled, false);
+    if (s_connect_timer) esp_timer_stop(s_connect_timer);
+    /* 必须 stop 驱动，下一次 start 才可靠收到 STA_START；AP 配网由其服务接管。 */
+    esp_err_t err = esp_wifi_stop();
+    if (err == ESP_ERR_WIFI_NOT_STARTED) err = ESP_OK;
+    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_GOT_IP_BIT | WIFI_FAIL_BIT);
+    set_state(WIFI_STATE_IDLE);
+    unlock();
     return err;
 }
 
@@ -331,11 +312,17 @@ int8_t wifi_service_get_rssi(void)
 
 esp_err_t wifi_service_deinit(void)
 {
+    wifi_service_disconnect();
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, &wifi_event_handler);
     if (s_connect_timer) {
         esp_timer_stop(s_connect_timer);
         esp_timer_delete(s_connect_timer);
         s_connect_timer = NULL;
     }
+    atomic_store(&s_connect_enabled, false);
+    set_state(WIFI_STATE_IDLE);
     esp_wifi_stop();
     esp_wifi_deinit();
 
@@ -349,6 +336,5 @@ esp_err_t wifi_service_deinit(void)
         s_mutex = NULL;
     }
 
-    set_state(WIFI_STATE_IDLE);
     return ESP_OK;
 }

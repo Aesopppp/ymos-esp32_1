@@ -23,6 +23,7 @@ static const audio_codec_gpio_if_t *gpio_if;
 static opus_dec_handle_t decoder;
 static SemaphoreHandle_t output_lock;
 static atomic_int state;
+static atomic_int output_volume;
 static audio_out_event_cb_t callback;
 static void *callback_arg;
 static int16_t *playback_ref;
@@ -109,7 +110,8 @@ esp_err_t audio_out_init(uint8_t i2c_addr)
     esp_codec_dev_sample_info_t sample={.sample_rate=AUDIO_OUT_SAMPLE_RATE,.channel=2,.bits_per_sample=16};
     if ((err=esp_codec_dev_open(speaker,&sample))!=ESP_OK) goto fail;
     if ((err=esp_codec_dev_open(microphone,&sample))!=ESP_OK) goto fail;
-    if ((err=esp_codec_dev_set_out_vol(speaker,40))!=ESP_OK) goto fail;
+    if ((err=esp_codec_dev_set_out_vol(speaker,AUDIO_OUT_DEFAULT_VOLUME))!=ESP_OK) goto fail;
+    atomic_store(&output_volume, AUDIO_OUT_DEFAULT_VOLUME);
     if ((err=esp_codec_dev_set_in_gain(microphone,30.0f))!=ESP_OK) goto fail;
     output_lock=xSemaphoreCreateMutex(); decoder=opus_dec_create(NULL);
     playback_ref_lock = xSemaphoreCreateMutex();
@@ -158,6 +160,22 @@ esp_err_t audio_out_deinit(void)
     playback_ref_read = playback_ref_write = playback_ref_count = 0;
     playback_streaming = false;
     state=AUDIO_OUT_STATE_NONE; return ESP_OK;
+}
+
+esp_err_t audio_out_set_volume(int volume)
+{
+    if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
+    if (!speaker || !output_lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(output_lock, portMAX_DELAY);
+    esp_err_t err = esp_codec_dev_set_out_vol(speaker, volume);
+    if (err == ESP_OK) atomic_store(&output_volume, volume);
+    xSemaphoreGive(output_lock);
+    return err;
+}
+
+int audio_out_get_volume(void)
+{
+    return atomic_load(&output_volume);
 }
 
 /* All PCM state and hardware writes are serialized by output_lock.

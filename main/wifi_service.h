@@ -65,7 +65,7 @@ esp_err_t wifi_service_connect(const char *ssid, const char *password,
                                 uint32_t timeout_ms);
 
 /**
- * @brief 断开 Wi-Fi
+ * @brief 停止 STA 和自动重连；不删除已保存的 Wi-Fi 配置
  */
 esp_err_t wifi_service_disconnect(void);
 
@@ -105,7 +105,7 @@ int8_t wifi_service_get_rssi(void);
 esp_err_t wifi_service_deinit(void);
 
 /**
- * @brief 启动 Wi-Fi 连接（异步，无超时；连接状态通过 event_bus 事件通知）
+ * @brief 启动 Wi-Fi 连接（异步，60 秒内未获得 IP 则发布失败事件）
  *
  * 适合在 app_main / wifi_task 中调用，无需同步等待结果。
  * 连接成功/失败/GOT_IP/DISCONNECTED 事件通过 event_bus 发布。
@@ -113,7 +113,7 @@ esp_err_t wifi_service_deinit(void);
  * @param ssid      SSID
  * @param password  密码（可为空字符串表示开放网络）
  */
-void wifi_service_start(const char *ssid, const char *password);
+esp_err_t wifi_service_start(const char *ssid, const char *password);
 
 #ifdef __cplusplus
 }

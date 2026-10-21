@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "app_main.c"
+        "button_service.c"
         "app_state.c"
         "event_bus.c"
         "audio_in.c"
@@ -27,6 +28,7 @@ idf_component_register(
         opus_codec
         esp_websocket_client
         esp_wifi
+        esp_adc
         nvs_flash
         esp_timer
         esp_system
