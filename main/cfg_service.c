@@ -47,6 +47,7 @@ static const char *s_key_names[] = {
     "last_err",
     "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_client_id",
     "mqtt_username", "mqtt_password", "mqtt_base_topic", "chip_id",
+    "rm_enabled", "rm_uri", "rm_api_key", "rm_token", "rm_username", "rm_password",
     "",
 };
 
@@ -236,7 +237,8 @@ esp_err_t cfg_service_set_str(cfg_key_t key, const char *value)
         return err;
     }
 
-    ESP_LOGD(TAG, "cfg '%s' = '%s'", nvs_key, value);
+    /* 配置可能包含 Wi-Fi、WebSocket 或 MQTT 凭据，不输出值。 */
+    ESP_LOGD(TAG, "cfg '%s' updated", nvs_key);
     return ESP_OK;
 }
 

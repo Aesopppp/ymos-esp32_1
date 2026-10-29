@@ -1,0 +1,9 @@
+/* 复制为 acos_reminder_local_config.h（已被 Git 忽略）。不要提交真实凭据。
+ * 空 API Key + USE_WS_TOKEN=true：沿用已有 ACOS WebSocket token 进行测试。
+ * 独立 Key：填写下方 API_KEY，并根据平台配置 MQTT 用户名和密码。 */
+#define ACOS_REMINDER_ENABLED true
+#define ACOS_REMINDER_URI "mqtt://47.94.139.172:11116"
+#define ACOS_REMINDER_API_KEY ""
+#define ACOS_REMINDER_USE_WS_TOKEN true
+#define ACOS_REMINDER_USERNAME ""
+#define ACOS_REMINDER_PASSWORD ""

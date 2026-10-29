@@ -312,6 +312,10 @@ void audio_out_set_streaming(bool active)
         stream_open=true; stream_eof=false; stream_drained=false; output_started=false;
         drain_blocks=0; underruns=supplied_samples=decoded_packets=decode_max_us=write_max_us=0;
         stats_at=esp_timer_get_time(); state=AUDIO_OUT_STATE_PLAYING;
+    } else if(active && stream_eof) {
+        /* 同一回复的下一音频段：撤销 EOF，保留尚未播出的 PCM 和 DMA 尾音。
+         * 不能清空环形队列，否则工具调用前后的短段会被截断。 */
+        stream_eof=false; stream_drained=false; drain_blocks=0;
     } else if(!active) {
         stream_eof=true; drain_blocks=0; /* flush even replies shorter than prefill */
     }

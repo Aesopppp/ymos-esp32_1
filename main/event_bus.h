@@ -33,6 +33,7 @@ typedef enum {
     EV_WS_SPEECH_STOPPED    = 41,
     EV_WS_RESPONSE_DONE     = 42,
     EV_AUDIO_UPLOAD_FAILED  = 43,
+    EV_WS_RESPONSE_CONTINUED = 44, /* 明确的新 response.created，继续工具后续语音 */
     EV_AUDIO_WAKE_DETECTED  = 10,
     EV_AUDIO_SPEECH_START   = 13,
     EV_AUDIO_SPEECH_END     = 14,

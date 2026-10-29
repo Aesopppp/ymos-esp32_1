@@ -84,6 +84,14 @@ esp_err_t ws_service_cancel_response(void);
 esp_err_t ws_service_authenticate(void);
 uint32_t ws_service_generation(void);
 void ws_service_log_cancel_wait(void);
+/** 主任务超时诊断：仅记录回复阶段/音频计数，不输出请求正文。 */
+void ws_service_log_response_wait(void);
+
+/** 主任务调用：先开放独立回复接收门，再原样转发提醒 JSON。
+ * 期间 send_opus_frame 拒绝麦克风上传；不启动 audio_in。
+ * 调用可阻塞至一次 WS send 超时（1 秒），不能在网络回调中调用。 */
+esp_err_t ws_service_request_reminder(const char *payload);
+bool ws_service_reminder_timed_out(void);
 
 /** Generic JSON text send (for future protocol extensions). */
 esp_err_t ws_service_send_json(const char *json_str);

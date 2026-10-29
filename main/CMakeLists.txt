@@ -8,6 +8,7 @@ idf_component_register(
         "wake_word.c"
         "audio_out.c"
         "ws_service.c"
+        "response_stream.c"
 
 
         "opus_codec.c"
@@ -19,6 +20,8 @@ idf_component_register(
         "cfg_service.c"
         "log_service.c"
         "mqtt_service.c"
+        "acos_reminder_service.c"
+        "reminder_message.c"
         "mqtt_topics.c"
         "provisioning_service.c"
     INCLUDE_DIRS "."
@@ -43,6 +46,7 @@ idf_component_register(
         esp_psram
         mbedtls
         mqtt
+        cjson
         esp_http_server
         esp_driver_gpio
         esp_driver_i2c

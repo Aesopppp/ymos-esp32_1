@@ -13,3 +13,4 @@ Thumbs.db
 .env.*
 __pycache__/
 /main/wifi_local_config.h
+/main/acos_reminder_local_config.h

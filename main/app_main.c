@@ -45,6 +45,7 @@
 #include "audio_in.h"
 #include "wake_word.h"
 #include "mqtt_service.h"
+#include "acos_reminder_service.h"
 #include "provisioning_service.h"
 #include "button_service.h"
 #include "button_policy.h"
@@ -98,6 +99,7 @@ static esp_err_t system_init(void)
 
     ESP_ERROR_CHECK(ws_service_init());
     ESP_ERROR_CHECK(mqtt_service_init(s_bus));
+    ESP_ERROR_CHECK(acos_reminder_service_init());
     ESP_ERROR_CHECK(provisioning_service_init(s_bus));
     audio_in_config_t input_config = audio_in_default_config();
     input_config.bus = s_bus;
@@ -121,11 +123,24 @@ static bool session_requested;
 static int64_t retry_at_ms, auth_deadline_ms, cancel_deadline_ms, response_deadline_ms;
 static int64_t resume_deadline_ms;
 static int64_t cancel_probe_ms;
+/* 主任务借用服务队列的 active；finish 后立即清空，避免使用已释放正文。 */
+static const reminder_message_t *active_reminder;
+static int64_t reminder_setup_deadline_ms;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
+static void finish_reminder(reminder_outcome_t outcome)
+{
+    if (!active_reminder) return;
+    active_reminder = NULL;
+    reminder_setup_deadline_ms = 0;
+    acos_reminder_service_finish(outcome);
+}
+
 static void end_conversation(const char *reason)
 {
+    /* 手动结束/配网/断网都释放 active，已完成/失败路径会先明确记录结果。 */
+    finish_reminder(REMINDER_CANCELLED);
     session_requested = conversation_active = false;
     retry_at_ms = auth_deadline_ms = cancel_deadline_ms = response_deadline_ms = 0;
     resume_deadline_ms = cancel_probe_ms = 0;
@@ -146,6 +161,12 @@ static void end_conversation(const char *reason)
 static void recover_session(const char *reason)
 {
     if (!session_requested || provisioning_service_is_active()) return;
+    if (active_reminder) {
+        /* 不自动重放已发送或已播放一部分的提醒。失败不去重，平台可重新投递。 */
+        finish_reminder(REMINDER_FAILED);
+        end_conversation(reason);
+        return;
+    }
     ESP_LOGW(TAG, "Session recovery: %s", reason);
     if (conversation_active && !resume_deadline_ms) resume_deadline_ms = now_ms() + 60000;
     app_state_back_to_wait_wake(false);
@@ -217,16 +238,28 @@ static void start_conversation(const char *reason)
 /* 手动/语音打断共用取消边界；只在主任务操作 WS，保留已有预录音补传逻辑。 */
 static void interrupt_response(bool manual)
 {
-    if (!conversation_active || app_state_get() != APP_STATE_PLAYING ||
+    if ((!conversation_active && !active_reminder) || app_state_get() != APP_STATE_PLAYING ||
         ws_service_get_state() != WS_STATE_CONNECTED) return;
     if (manual) wake_word_protect_preroll();
     esp_err_t err = ws_service_cancel_response();
     if (err == ESP_ERR_NOT_FOUND) {
+        if (active_reminder) {
+            /* 扬声器刚好排空、完成事件尚在队列：REC/人声仍应开始对话。 */
+            finish_reminder(REMINDER_CANCELLED);
+            conversation_active = true;
+            resume_listening(true, "reminder already finished at interruption");
+            return;
+        }
         /* 回答恰好结束，队列内的正常完成事件负责恢复监听。 */
         wake_word_reset_barge_in();
         return;
     }
     if (err != ESP_OK) { recover_session("response.cancel send failed"); return; }
+    if (active_reminder) {
+        finish_reminder(REMINDER_CANCELLED);
+        conversation_active = true;
+        ESP_LOGI(TAG, "Reminder interrupted; continuing as a normal conversation");
+    }
     app_state_set(APP_STATE_CANCELLING);
     app_state_pause_silence_timer();
     response_deadline_ms = 0;
@@ -251,6 +284,8 @@ static void enter_provisioning(const char *reason)
     if (provisioning_service_is_active()) return;
     end_conversation(reason);
     (void)mqtt_service_stop();
+    esp_err_t reminder_err = acos_reminder_service_stop();
+    if (reminder_err != ESP_OK) ESP_LOGW(TAG, "Reminder MQTT stop failed: %s", esp_err_to_name(reminder_err));
     esp_err_t err = provisioning_service_start();
     if (err == ESP_OK) {
         app_state_set(APP_STATE_PROVISIONING);
@@ -314,7 +349,41 @@ static bool tagged_ws_event(event_type_t id)
     return id == EV_WS_CONNECTED || id == EV_WS_AUTH_OK || id == EV_WS_ERROR ||
            id == EV_WS_DISCONNECTED || id == EV_WS_SERVER_ERROR || id == EV_WS_CANCEL_DONE ||
            id == EV_WS_SPEECH_STARTED || id == EV_WS_SPEECH_STOPPED ||
-           id == EV_WS_RESPONSE_DONE || id == EV_AUDIO_UPLOAD_FAILED;
+           id == EV_WS_RESPONSE_DONE || id == EV_WS_RESPONSE_CONTINUED ||
+           id == EV_AUDIO_UPLOAD_FAILED;
+}
+
+/* 提醒的请求入口：不调用 start_listening、不启动 audio_in。 */
+static void request_reminder_audio(void)
+{
+    reminder_setup_deadline_ms = 0;
+    if (ws_service_request_reminder(active_reminder->payload) != ESP_OK)
+        recover_session("reminder request failed");
+}
+
+static void start_pending_reminder(void)
+{
+    if (session_requested || active_reminder || provisioning_service_is_active() ||
+        wifi_service_get_state() != WIFI_STATE_GOT_IP ||
+        app_state_get() != APP_STATE_WAIT_WAKE || !audio_out_is_drained()) return;
+    active_reminder = acos_reminder_service_take();
+    if (!active_reminder) return;
+    session_requested = true;
+    conversation_active = false;
+    app_state_pause_silence_timer();
+    if (audio_in_stop(audio_in_get_handle()) != ESP_OK ||
+        wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
+        recover_session("reminder audio preparation failed");
+        return;
+    }
+    wake_word_clear_audio_buffer();
+    wake_word_reset_barge_in();
+    app_state_set(APP_STATE_REMINDER_WAITING);
+    reminder_setup_deadline_ms = now_ms() + 20000;
+    led_set_connecting();
+    ESP_LOGI(TAG, "Reminder requested while idle; listening stage skipped, microphone upload off");
+    if (ws_service_get_state() == WS_STATE_CONNECTED) request_reminder_audio();
+    else retry_at_ms = now_ms();
 }
 
 static void main_task(void *arg)
@@ -343,6 +412,8 @@ static void main_task(void *arg)
                     esp_err_t mqtt_err = mqtt_service_start();
                     if (mqtt_err != ESP_OK) ESP_LOGW(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_err));
                 }
+                esp_err_t reminder_err = acos_reminder_service_start();
+                if (reminder_err != ESP_OK) ESP_LOGW(TAG, "Reminder MQTT start failed: %s", esp_err_to_name(reminder_err));
                 /* 普通联网不打开 WS；重复 IP 事件不能打断正在进行的对话。 */
                 if (!session_requested) {
                     ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word or REC before connecting");
@@ -374,6 +445,8 @@ static void main_task(void *arg)
                     wifi_service_get_state() == WIFI_STATE_IDLE) break;
                 if (event.type == EV_WIFI_CONNECT_FAILED && wifi_service_get_state() != WIFI_STATE_FAIL) break;
                 (void)mqtt_service_stop();
+                if (acos_reminder_service_stop() != ESP_OK) ESP_LOGW(TAG, "Reminder MQTT stop pending");
+                finish_reminder(REMINDER_FAILED);
                 if (event.type == EV_WIFI_CONNECT_FAILED) {
                     provisioning_service_rollback();
                     enter_provisioning("Wi-Fi connection failed");
@@ -387,7 +460,10 @@ static void main_task(void *arg)
                 break;
             case EV_BUTTON_TALK:
                 if (current_state == APP_STATE_PLAYING) interrupt_response(true);
-                else start_conversation("REC button");
+                else {
+                    if (active_reminder) end_conversation("REC cancelled pending reminder");
+                    start_conversation("REC button");
+                }
                 break;
             case EV_BUTTON_END_TALK:
                 if (!provisioning_service_is_active()) end_conversation("REC held for 2s");
@@ -403,6 +479,7 @@ static void main_task(void *arg)
                 break;
             case EV_WS_AUTH_OK:
                 auth_deadline_ms = retry_at_ms = 0;
+                if (active_reminder) { request_reminder_audio(); break; }
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
                 conversation_active = true;
                 resume_listening(false, resume_deadline_ms ? "reconnect" : "wake/REC connect complete");
@@ -428,8 +505,10 @@ static void main_task(void *arg)
                     app_state_reset_silence_timer();
                 break;
             case EV_WS_SPEECH_STOPPED:
+            case EV_WS_RESPONSE_CONTINUED:
                 if (!conversation_active || current_state != APP_STATE_LISTENING) break;
-                ESP_LOGI(TAG, "Server speech_stopped; waiting for reply");
+                ESP_LOGI(TAG, "%s; waiting for reply", event.type == EV_WS_RESPONSE_CONTINUED ?
+                         "Server response continued after tool stage" : "Server speech_stopped");
                 app_state_pause_silence_timer();
                 if (audio_in_stop(audio_in_get_handle()) != ESP_OK) {
                     recover_session("audio stop timeout");
@@ -439,6 +518,13 @@ static void main_task(void *arg)
                 response_deadline_ms = now_ms() + 45000;
                 break;
             case EV_AUDIO_OUT_START:
+                if (active_reminder && current_state == APP_STATE_REMINDER_WAITING &&
+                    ws_service_get_state() == WS_STATE_CONNECTED && !audio_out_is_drained()) {
+                    app_state_set(APP_STATE_PLAYING);
+                    led_set_speaking();
+                    ESP_LOGI(TAG, "Reminder playback started; microphone upload remains off");
+                    break;
+                }
                 if (conversation_active && current_state == APP_STATE_PLAYING &&
                     ws_service_get_state() == WS_STATE_CONNECTED) {
                     response_deadline_ms = now_ms() + 180000;
@@ -455,6 +541,11 @@ static void main_task(void *arg)
                 }
                 break;
             case EV_WS_RESPONSE_DONE:
+                if (active_reminder) {
+                    finish_reminder(REMINDER_COMPLETED);
+                    end_conversation("reminder playback drained");
+                    break;
+                }
                 if (conversation_active && current_state == APP_STATE_PLAYING) {
                     ESP_LOGI(TAG, "Reply complete; continue conversation");
                     resume_listening(false, "reply completed");
@@ -474,6 +565,9 @@ static void main_task(void *arg)
         }
         int64_t now = now_ms();
         save_volume_if_due(now);
+        if (active_reminder && ((reminder_setup_deadline_ms && now >= reminder_setup_deadline_ms) ||
+                                ws_service_reminder_timed_out()))
+            recover_session("reminder connection/audio stream timed out");
         if (cancel_probe_ms && now >= cancel_probe_ms) {
             cancel_probe_ms = 0;
             ESP_LOGW(TAG, "Cancel confirmation delayed; keeping connection while waiting (limit 8 s)");
@@ -486,8 +580,10 @@ static void main_task(void *arg)
             ws_service_log_cancel_wait();
             recover_session("cancel acknowledgement timed out");
         }
-        else if (response_deadline_ms && now >= response_deadline_ms)
+        else if (response_deadline_ms && now >= response_deadline_ms) {
+            ws_service_log_response_wait();
             recover_session("server reply timed out");
+        }
         else if (auth_deadline_ms && now >= auth_deadline_ms)
             recover_session("connection/authentication timed out");
         if (session_requested && retry_at_ms && now >= retry_at_ms &&
@@ -501,6 +597,7 @@ static void main_task(void *arg)
                 auth_deadline_ms = now_ms() + 20000;
             } else retry_at_ms = now_ms() + 5000;
         }
+        start_pending_reminder();
         led_service_poll(s_led, esp_log_timestamp());
         vTaskDelay(pdMS_TO_TICKS(10));
     }

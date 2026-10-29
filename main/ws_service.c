@@ -1,9 +1,10 @@
 #include "ws_service.h"
 #include "audio_out.h"
 #include "proto_service.h"
-#include "response_flow.h"
+#include "response_stream.h"
 #include "ws_rx_policy.h"
 #include "reply_boundary.h"
+#include "reminder_playback_policy.h"
 #include "event_bus.h"
 #include "cfg_service.h"
 #include "board_config.h"
@@ -30,18 +31,21 @@ static int opcode;
 static QueueHandle_t rx_queue;
 static SemaphoreHandle_t playback_lock;
 static TaskHandle_t rx_task;
-static response_phase_t response_phase = RESPONSE_IDLE;
+static response_stream_t reply; /* playback_lock 保护，包含音频段/工具阶段状态 */
 static uint32_t rx_drop_count;
 static atomic_size_t rx_bytes;
 static atomic_uint wire_turn, wire_done_turn;
-static uint32_t playing_turn;
 static uint32_t played_frames, discarded_frames;
-static bool playback_eof;
 static atomic_bool cancel_requested;
+static atomic_bool rx_dispatching;
+static uint32_t lifecycle_log_ms; /* worker 专用，限制扩展事件诊断频率 */
 /* Scheduling hint only: never use this to discard audio. */
 static atomic_bool cancel_waiting;
 static atomic_int last_control_event;
 static atomic_uint last_rx_ms;
+static atomic_bool reminder_mode;
+static uint32_t reminder_started_ms; /* playback_lock 保护 */
+static atomic_uint reminder_rx_ms;
 typedef struct {
     uint8_t *data;
     size_t len;
@@ -70,7 +74,8 @@ static void log_server_error(const proto_msg_t *msg)
     size_t len = msg->error_msg_len > 0 ? (size_t)msg->error_msg_len : 0;
     if (len >= sizeof(message)) len = sizeof(message) - 1;
     if (len) memcpy(message, msg->error_msg, len);
-    bool sensitive = strstr(message, "sk-") || strstr(message, "token") ||
+    /* 提醒错误可能回显原始请求，其中 to 含企业 Key；只保留错误码。 */
+    bool sensitive = atomic_load(&reminder_mode) || strstr(message, "sk-") || strstr(message, "token") ||
                      strstr(message, "password") || strstr(message, "Bearer");
     const cfg_key_t keys[] = { CFG_KEY_ACOS_TOKEN, CFG_KEY_WIFI_PASSWORD };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
@@ -99,35 +104,47 @@ static bool cancel_already_done(const proto_msg_t *msg)
                               msg->error_msg, msg->error_msg_len);
 }
 
-static bool field_equals(const char *text, int len, const char *expected)
-{
-    return text && len >= 0 && (size_t)len == strlen(expected) &&
-           memcmp(text, expected, len) == 0;
-}
-
-static bool terminal_boundary(const proto_msg_t *msg)
-{
-    return msg->evt == PROTO_EVT_RESPONSE_DONE ||
-           (msg->evt == PROTO_EVT_RESPONSE_TERMINAL &&
-            (field_equals(msg->status, msg->status_len, "completed") ||
-             field_equals(msg->status, msg->status_len, "cancelled") ||
-             field_equals(msg->status, msg->status_len, "canceled")));
-}
-
-/* Runs before queueing, without the playback mutex or any I2S/network wait.
- * The worker preserves FIFO ordering; these atomics only tell cancel whether
- * the server has already finished the response still playing locally. */
+/* RX 回调只观察网络音频进度，不负责结束播放。completed != audio.done。
+ * 工具/消息阶段由 worker 按 ID 校验后修改 audio_eof；不能在这里让迟到或
+ * 被忽略的控制帧撤销当前边界。FIFO/rx_dispatching 保护尚未处理的阶段。 */
 static void observe_control(const proto_msg_t *msg)
 {
     atomic_store(&last_control_event, msg->evt);
-    if (msg->evt == PROTO_EVT_SPEECH_STOPPED) {
+    if (response_stream_starts_turn(msg, atomic_load(&reminder_mode), atomic_load(&cancel_requested))) {
         atomic_fetch_add(&wire_turn, 1);
         atomic_store(&wire_done_turn, 0);
-    } else if (terminal_boundary(msg)) {
+    } else if (msg->evt == PROTO_EVT_RESPONSE_DONE) {
         atomic_store(&wire_done_turn, atomic_load(&wire_turn));
-        ESP_LOGI(TAG, "RX response boundary: turn=%lu event=%d",
-                 (unsigned long)atomic_load(&wire_turn), msg->evt);
     }
+}
+
+/* 状态只输出固定类别，避免扩展字段带入业务正文。 */
+static const char *lifecycle_status(const proto_msg_t *msg)
+{
+    if (!msg->status[0]) return "unspecified";
+    if (strcmp(msg->status, "completed") == 0) return "completed";
+    if (strcmp(msg->status, "failed") == 0) return "failed";
+    if (strcmp(msg->status, "incomplete") == 0) return "incomplete";
+    if (strcmp(msg->status, "cancelled") == 0 || strcmp(msg->status, "canceled") == 0)
+        return "cancelled";
+    return "other";
+}
+
+/* 不打印业务正文、工具参数或原始 ID；哈希仅供前后阶段关联。 */
+static void log_lifecycle(const proto_msg_t *msg, response_stream_action_t action)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (action == RESPONSE_STREAM_NONE && (uint32_t)(now - lifecycle_log_ms) < 5000) return;
+    lifecycle_log_ms = now;
+    uint32_t id_hash = 0;
+    for (const unsigned char *p = (const unsigned char *)msg->response_id; *p; ++p)
+        id_hash = (id_hash ^ *p) * 16777619u;
+    ESP_LOGI(TAG, "Response stage: turn=%lu event=%s id_hash=%08lx status=%s has_tool=%d "
+             "action=%d phase=%d tool_pending=%d eof=%d decoded=%lu discarded=%lu queue=%u",
+             (unsigned long)reply.turn, proto_event_name(msg->evt), (unsigned long)id_hash,
+             lifecycle_status(msg), msg->has_tool_call, action, reply.phase, reply.tool_pending,
+             reply.audio_eof, (unsigned long)played_frames, (unsigned long)discarded_frames,
+             (unsigned)uxQueueMessagesWaiting(rx_queue));
 }
 
 static void release_rx_frame(uint8_t *data, size_t len)
@@ -165,22 +182,32 @@ static void handle_frame(const rx_frame_t *packet)
     if (packet->opcode == 2) {
         /* Decode/I2S on this worker, never on the client's locked RX task.
          * Cancel takes this same lock, so old audio cannot restart playback. */
+        bool after_tool = reply.tool_pending;
         if (state == WS_STATE_CONNECTED &&
-            !playback_eof &&
-            reply_packet_current(playing_turn, packet->turn) &&
-            response_accept_audio(&response_phase)) {
+            response_stream_accept_audio(&reply, packet->turn)) {
             audio_out_set_streaming(true);
             if (audio_out_play_opus(packet->data, packet->len) < 0)
                 publish(EV_WS_SERVER_ERROR, packet->generation);
-            else ++played_frames;
-        } else if (reply_packet_current(playing_turn, packet->turn)) {
+            else {
+                ++played_frames;
+                /* 每回合首帧/工具续流首帧各记录一次，不逐帧打印。 */
+                if (played_frames == 1 || after_tool)
+                    ESP_LOGI(TAG, "Reply audio accepted: turn=%lu after_tool=%d decoded=%lu",
+                             (unsigned long)reply.turn, after_tool, (unsigned long)played_frames);
+            }
+        } else if (reply_packet_current(reply.turn, packet->turn)) {
             ++discarded_frames;
         }
         xSemaphoreGive(playback_lock);
         return;
     }
     proto_msg_t msg;
-    if (proto_parse_json((char *)packet->data, &msg) != PROTO_OK) {
+    proto_result_t result = proto_parse_json((char *)packet->data, &msg);
+    if (result != PROTO_OK) {
+        if (result != PROTO_ERR_UNKNOWN_TYPE) {
+            ESP_LOGW(TAG, "Invalid control frame: parse=%d bytes=%u", result, (unsigned)packet->len);
+            publish(EV_WS_SERVER_ERROR, packet->generation);
+        }
         xSemaphoreGive(playback_lock); return;
     }
     switch (msg.evt) {
@@ -190,52 +217,54 @@ static void handle_frame(const rx_frame_t *packet)
         publish(EV_WS_AUTH_OK, packet->generation);
         break;
     case PROTO_EVT_SPEECH_STARTED:
+        if (atomic_load(&reminder_mode)) break;
         /* Speech detection does not acknowledge response.cancel. */
+        response_stream_user_started(&reply);
         publish(EV_WS_SPEECH_STARTED, packet->generation);
         break;
     case PROTO_EVT_SPEECH_STOPPED:
-        if (response_phase == RESPONSE_CANCELLING) break;
-        playing_turn = packet->turn;
-        playback_eof = false;
+        if (atomic_load(&reminder_mode)) break;
+        if (reply.phase == RESPONSE_CANCELLING) break;
+        response_stream_begin(&reply, packet->turn);
         played_frames = discarded_frames = 0;
-        response_expect(&response_phase);
         publish(EV_WS_SPEECH_STOPPED, packet->generation);
         break;
+    case PROTO_EVT_RESPONSE_CREATED:
+    case PROTO_EVT_RESPONSE_TOOL:
+    case PROTO_EVT_RESPONSE_MESSAGE:
     case PROTO_EVT_RESPONSE_DONE:
     case PROTO_EVT_RESPONSE_TERMINAL: {
-        if (!terminal_boundary(&msg) || !reply_packet_current(playing_turn, packet->turn)) break;
-        if (response_phase == RESPONSE_PLAYING || response_phase == RESPONSE_WAITING) {
-            if (!playback_eof) {
-                playback_eof = true;
-                audio_out_set_streaming(false);
-                ESP_LOGI(TAG, "Response received; draining PCM tail turn=%lu", (unsigned long)playing_turn);
-            }
-            break;
+        response_stream_action_t action = response_stream_control(&reply, packet->turn, &msg);
+        log_lifecycle(&msg, action);
+        if (action == RESPONSE_STREAM_AUDIO_END) {
+            audio_out_set_streaming(false);
+        } else if (action == RESPONSE_STREAM_CANCELLED) {
+            atomic_store(&cancel_requested, false);
+            atomic_store(&reminder_mode, false);
+            publish(EV_WS_CANCEL_DONE, packet->generation);
+        } else if (action == RESPONSE_STREAM_FAILED) {
+            audio_out_stop();
+            publish(EV_WS_SERVER_ERROR, packet->generation);
+        } else if (action == RESPONSE_STREAM_CONTINUED) {
+            /* 仅明确的新 response.created 能恢复已排空回合；迟到二进制不能。 */
+            publish(EV_WS_RESPONSE_CONTINUED, packet->generation);
         }
-        response_end_t end = response_finish(&response_phase);
-        if (end != RESPONSE_END_IGNORE)
-            ESP_LOGI(TAG, "Playback boundary: turn=%lu reason=%s played=%lu discarded=%lu",
-                     (unsigned long)playing_turn, end == RESPONSE_END_CANCELLED ? "cancelled" : "normal",
-                     (unsigned long)played_frames, (unsigned long)discarded_frames);
-        if (end == RESPONSE_END_CANCELLED) atomic_store(&cancel_requested, false);
-        if (end != RESPONSE_END_IGNORE) audio_out_set_streaming(false);
-        if (end == RESPONSE_END_CANCELLED) publish(EV_WS_CANCEL_DONE, packet->generation);
-        else if (end == RESPONSE_END_NORMAL) publish(EV_WS_RESPONSE_DONE, packet->generation);
         break;
     }
     case PROTO_EVT_ERROR:
         if (cancel_already_done(&msg) && state == WS_STATE_CONNECTED) {
             ESP_LOGI(TAG, "Cancel already completed; keeping WebSocket connected");
-            if (response_phase == RESPONSE_CANCELLING) {
-                response_finish(&response_phase);
+            if (reply.phase == RESPONSE_CANCELLING) {
+                response_stream_cancel_done(&reply);
                 atomic_store(&cancel_requested, false);
+                atomic_store(&reminder_mode, false);
                 publish(EV_WS_CANCEL_DONE, packet->generation);
             }
         } else {
             log_server_error(&msg);
             /* Business error != transport disconnect. Main explicitly
              * recovers the session instead of poisoning connection state. */
-            response_phase = RESPONSE_DISCARD;
+            reply.phase = RESPONSE_DISCARD;
             publish(EV_WS_SERVER_ERROR, packet->generation);
         }
         break;
@@ -246,14 +275,16 @@ static void handle_frame(const rx_frame_t *packet)
 static void finish_playback_if_drained(void)
 {
     xSemaphoreTake(playback_lock, portMAX_DELAY);
-    if (playback_eof && state == WS_STATE_CONNECTED &&
-        response_playback_finished(response_phase, playback_eof, audio_out_is_drained())) {
-        response_finish(&response_phase);
-        playback_eof = false;
+    if (state == WS_STATE_CONNECTED && !atomic_load(&rx_dispatching) &&
+        response_stream_finish_if_drained(&reply, audio_out_is_drained(),
+            uxQueueMessagesWaiting(rx_queue) == 0,
+            reply_boundary_received(reply.turn, atomic_load(&wire_done_turn)))) {
         ESP_LOGI(TAG, "Playback drained: turn=%lu decoded=%lu discarded=%lu",
-                 (unsigned long)playing_turn, (unsigned long)played_frames,
+                 (unsigned long)reply.turn, (unsigned long)played_frames,
                  (unsigned long)discarded_frames);
-        publish(EV_WS_RESPONSE_DONE, atomic_load(&generation));
+        /* 空响应不能算播报成功，避免平台尚未接好语音时静默吞掉提醒。 */
+        publish(atomic_load(&reminder_mode) && !played_frames ? EV_WS_SERVER_ERROR :
+                EV_WS_RESPONSE_DONE, atomic_load(&generation));
     }
     xSemaphoreGive(playback_lock);
 }
@@ -322,9 +353,11 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
         memcpy(frame + received, data->data_ptr, data->data_len);
         received += data->data_len;
         if (received == frame_size) {
+            atomic_store(&rx_dispatching, true);
             frame[received] = 0;
             atomic_store(&last_rx_ms, (uint32_t)(esp_timer_get_time() / 1000));
             rx_frame_t packet = {.data=frame, .len=received, .opcode=opcode, .generation=gen};
+            if (opcode == 2) atomic_store(&wire_done_turn, 0);
             if (opcode == 1) {
                 proto_msg_t msg;
                 proto_result_t result = proto_parse_json((char *)frame, &msg);
@@ -333,9 +366,13 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
                     ESP_LOGW(TAG, "Unrecognized control while cancelling (parse=%d, bytes=%u)",
                              result, (unsigned)received);
             }
+            if (atomic_load(&reminder_mode) &&
+                (opcode == 2 || atomic_load(&wire_done_turn) == atomic_load(&wire_turn)))
+                atomic_store(&reminder_rx_ms, (uint32_t)(esp_timer_get_time() / 1000));
             packet.turn = atomic_load(&wire_turn);
             enqueue_rx_frame(&packet);
             frame = NULL; frame_size = received = 0;
+            atomic_store(&rx_dispatching, false);
         }
     }
 }
@@ -350,6 +387,7 @@ esp_err_t ws_service_init(void)
     cfg_service_get_str(CFG_KEY_WS_URL, uri, sizeof(uri), ACOS_WS_URL);
     esp_websocket_client_config_t cfg = {
         .uri = uri, .disable_auto_reconnect = true, .network_timeout_ms = 10000,
+        .task_stack = 6144, /* 有界 JSON 解析和协议字段副本，避免默认栈过紧。 */
         .crt_bundle_attach = esp_crt_bundle_attach,
         /* WebSocket-level keepalive: send a ping every 20s so server idle timeout
          * does not silently close the connection. PONG timeout 30s before we
@@ -411,12 +449,12 @@ esp_err_t ws_service_disconnect(void)
     atomic_fetch_add(&generation, 1);
     xSemaphoreTake(playback_lock, portMAX_DELAY);
     state = WS_STATE_DISCONNECTED;
-    response_phase = RESPONSE_IDLE;
-    playback_eof = false;
-    playing_turn = 0;
+    response_stream_reset(&reply);
+    atomic_store(&rx_dispatching, false);
     atomic_store(&wire_turn, 0);
     atomic_store(&wire_done_turn, 0);
     atomic_store(&cancel_requested, false);
+    atomic_store(&reminder_mode, false);
     audio_out_stop();
     xSemaphoreGive(playback_lock);
     rx_frame_t packet;
@@ -450,7 +488,7 @@ esp_err_t ws_service_send_json(const char *text)
 esp_err_t ws_service_send_opus_frame(const uint8_t *data, size_t len)
 {
     if (!data || !len || len > 65536) return ESP_ERR_INVALID_ARG;
-    if (state != WS_STATE_CONNECTED) return ESP_ERR_INVALID_STATE;
+    if (state != WS_STATE_CONNECTED || atomic_load(&reminder_mode)) return ESP_ERR_INVALID_STATE;
     size_t capacity = 4 * ((len + 2) / 3) + 1, written;
     char *encoded = malloc(capacity), *json = malloc(capacity + 256);
     if (!encoded || !json) { free(encoded); free(json); return ESP_ERR_NO_MEM; }
@@ -474,24 +512,30 @@ esp_err_t ws_service_cancel_response(void)
         xSemaphoreGive(playback_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    bool pending = response_begin_cancel(&response_phase);
-    const uint32_t cancelled_turn = playing_turn;
+    bool pending = response_stream_begin_cancel(&reply);
+    const uint32_t cancelled_turn = reply.turn;
     atomic_store(&cancel_requested, pending);
     if (pending) ESP_LOGI(TAG, "Cancel committed: turn=%lu played=%lu queued=%u",
-                         (unsigned long)playing_turn, (unsigned long)played_frames,
+                         (unsigned long)reply.turn, (unsigned long)played_frames,
                          (unsigned)uxQueueMessagesWaiting(rx_queue));
     if (pending && audio_out_stop() != ESP_OK) {
         xSemaphoreGive(playback_lock);
         return ESP_FAIL;
     }
-    bool local_only = pending && reply_boundary_received(playing_turn, atomic_load(&wire_done_turn));
+    bool local_only = pending && reply.audio_eof && !reply.tool_pending &&
+        !atomic_load(&rx_dispatching) && uxQueueMessagesWaiting(rx_queue) == 0 &&
+        reply_boundary_received(reply.turn, atomic_load(&wire_done_turn));
     if (local_only) {
-        response_finish(&response_phase);
+        response_stream_cancel_done(&reply);
+        atomic_store(&reminder_mode, false);
         ESP_LOGI(TAG, "Barge-in: server already finished turn=%lu; discard local audio, keep connection",
-                 (unsigned long)playing_turn);
+                 (unsigned long)reply.turn);
         publish(EV_WS_CANCEL_DONE, atomic_load(&generation));
     }
-    if (!pending || local_only) atomic_store(&cancel_requested, false);
+    if (!pending || local_only) {
+        atomic_store(&cancel_requested, false);
+        atomic_store(&reminder_mode, false);
+    }
     xSemaphoreGive(playback_lock);
     if (!pending) return ESP_ERR_NOT_FOUND;
     if (local_only) return ESP_OK;
@@ -506,4 +550,55 @@ void ws_service_log_cancel_wait(void)
              (unsigned)uxQueueMessagesWaiting(rx_queue), (unsigned)atomic_load(&rx_bytes),
              atomic_load(&last_control_event),
              (unsigned long)((uint32_t)(esp_timer_get_time()/1000) - atomic_load(&last_rx_ms)));
+}
+
+void ws_service_log_response_wait(void)
+{
+    if (!playback_lock || !rx_queue) return;
+    /* 主任务超时前取一次一致快照；不发送网络请求，不输出业务内容。 */
+    xSemaphoreTake(playback_lock, portMAX_DELAY);
+    ESP_LOGW(TAG, "Reply pending: turn=%lu phase=%d tool_pending=%d eof=%d "
+             "decoded=%lu discarded=%lu drained=%d queue=%u dispatching=%d wire_done=%d rx_age_ms=%lu",
+             (unsigned long)reply.turn, reply.phase, reply.tool_pending, reply.audio_eof,
+             (unsigned long)played_frames, (unsigned long)discarded_frames, audio_out_is_drained(),
+             (unsigned)uxQueueMessagesWaiting(rx_queue), atomic_load(&rx_dispatching),
+             reply_boundary_received(reply.turn, atomic_load(&wire_done_turn)),
+             (unsigned long)((uint32_t)(esp_timer_get_time()/1000) - atomic_load(&last_rx_ms)));
+    xSemaphoreGive(playback_lock);
+}
+
+esp_err_t ws_service_request_reminder(const char *payload)
+{
+    if (!payload || !payload[0]) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(playback_lock, portMAX_DELAY);
+    if (state != WS_STATE_CONNECTED || reply.phase != RESPONSE_IDLE ||
+        atomic_load(&reminder_mode) || !audio_out_is_drained()) {
+        xSemaphoreGive(playback_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 提醒没有 speech_stopped。先创建接收回合，再发送，避免快速下行被丢弃。
+     * MQTT 消息已由服务层校验/持有，这里不解析或重新序列化。 */
+    response_stream_begin(&reply, atomic_fetch_add(&wire_turn, 1) + 1);
+    atomic_store(&wire_done_turn, 0);
+    played_frames = discarded_frames = 0;
+    reminder_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    atomic_store(&reminder_rx_ms, reminder_started_ms);
+    atomic_store(&reminder_mode, true);
+    xSemaphoreGive(playback_lock);
+    /* 不持 playback_lock 等待网络；接收任务仍能处理快速到达的音频。 */
+    esp_err_t err = ws_service_send_json(payload);
+    if (err == ESP_OK) ESP_LOGI(TAG, "Reminder MQTT payload forwarded unchanged; waiting for Opus audio");
+    return err; /* 失败由主任务断连清理，不能自动重播可能已发送的请求。 */
+}
+
+bool ws_service_reminder_timed_out(void)
+{
+    xSemaphoreTake(playback_lock, portMAX_DELAY);
+    bool expired = atomic_load(&reminder_mode) && reminder_playback_expired(
+        (uint32_t)(esp_timer_get_time() / 1000), reminder_started_ms,
+        atomic_load(&reminder_rx_ms),
+        reply.audio_eof && !reply.tool_pending &&
+        reply_boundary_received(reply.turn, atomic_load(&wire_done_turn)));
+    xSemaphoreGive(playback_lock);
+    return expired;
 }

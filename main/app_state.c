@@ -189,6 +189,7 @@ const char *app_state_name(app_state_t s)
         case APP_STATE_SLEEP:           return "SLEEP";
         case APP_STATE_CANCELLING:      return "CANCELLING";
         case APP_STATE_PROVISIONING:    return "PROVISIONING";
+        case APP_STATE_REMINDER_WAITING: return "REMINDER_WAITING";
         default:                        return "UNKNOWN";
     }
 }

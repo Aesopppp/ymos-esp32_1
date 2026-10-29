@@ -12,9 +12,10 @@
 - **Barge-in 打断**：播放过程中检测用户说话，可取消当前回复并恢复收音。
 - **NVS 配置**：保存 Wi-Fi、ACOS、MQTT、设备身份和运行参数。
 - **MQTT 控制面**：Wi-Fi 获取 IP 后启动 MQTT，支持 LWT、在线状态、能力上报、命令和配置主题订阅。
+- **远程语音提醒**：独立订阅 ACOS MQTT 提醒，待机时将原消息转发到 WebSocket，跳过监听直接接收并播放 Opus；支持排队、去重、过期和超时恢复。
 - **设备身份**：首次启动读取 ESP32 MAC，生成并持久化 `chip_id`、`device_id` 和默认 `client_id`。
 
-当前 MQTT 主要用于状态和控制，实时音频仍通过 ACOS WebSocket 传输。SoftAP/HTTP 用户配网、MQTT 下行播报命令和定时提醒仍在开发中。
+MQTT 用于状态、控制和提醒触发，实时音频仍通过 ACOS WebSocket 传输。已接入 SoftAP/HTTP 配网与音量、对话、配网按键，见 [按键控制说明](docs/按键控制说明.md)。定时规则由平台管理，提醒协议、配置和联调步骤见 [ACOS 远程定时语音提醒](docs/acos-reminders.md)。
 
 ## 硬件与软件要求
 
@@ -104,7 +105,7 @@ idf.py -p COM3 flash monitor
 1. 初始化 NVS、音频编解码器、WakeNet 和 Wi-Fi。
 2. 读取 NVS 中的 Wi-Fi 凭据；没有保存值时使用 `board_config.h` 默认值。
 3. Wi-Fi 获得 IP 后启动 MQTT，发布在线状态和 `hello` 能力消息。
-4. 设备保持等待唤醒状态，不会自动建立 ACOS WebSocket。
+4. 设备保持等待唤醒状态，收到唤醒/REC 操作或有效远程提醒时才建立 ACOS WebSocket。提醒正常播完后关闭连接并回到待机。
 
 ### 语音对话
 
@@ -131,7 +132,7 @@ ymos/v1/device/{device_id}/config/set
 ymos/v1/device/{device_id}/config/ack
 ```
 
-MQTT 连接成功后会发布 retained 的 `online` 状态、注册 `offline` 遗嘱消息、发布设备能力并订阅命令和配置主题。当前已完成基础连接和命令事件投递，`wake_and_speak`、配置 ACK、消息去重和定时提醒仍需继续接入主状态机。
+YMOS MQTT 连接成功后会发布 retained 的 `online` 状态、注册 `offline` 遗嘱消息、发布设备能力并订阅命令和配置主题。该通道的 `wake_and_speak`、配置 ACK 和通用命令去重仍需完善；本次 ACOS 提醒使用独立的 `acos/<企业 API Key>/remind` 订阅与去重队列，不改变 YMOS 命令协议。
 
 ### 查看日志
 
@@ -139,7 +140,7 @@ MQTT 连接成功后会发布 retained 的 `online` 状态、注册 `offline` �
 idf.py -p COM3 monitor
 ```
 
-重点关注 `app_main`、`cfg_service`、`wifi_service`、`mqtt_service`、`ws_service` 和 `audio_out` 标签。
+重点关注 `app_main`、`cfg_service`、`wifi_service`、`mqtt_service`、`acos_reminder`、`ws_service` 和 `audio_out` 标签。
 
 ## 项目结构
 
@@ -150,7 +151,10 @@ main/
   wifi_service.*    Wi-Fi STA 连接与状态事件
   mqtt_service.*    MQTT 连接、LWT、订阅和状态上报
   mqtt_topics.*     MQTT 主题生成
+  acos_reminder_service.*  ACOS 提醒 MQTT 通道及队列管理
+  reminder_message.*      提醒协议校验、分片、去重和有界队列
   ws_service.*      ACOS WebSocket 客户端
+  response_stream.* 回复音频、工具阶段、结束边界与取消策略
   proto_service.*   ACOS JSON 协议解析与构造
   audio_in.c        麦克风、AFE、VAD 和 Opus 上行
   audio_out.c       Opus 解码、PCM 缓冲和扬声器播放
@@ -166,11 +170,14 @@ sdkconfig*          ESP-IDF 构建配置
 - 当前工程固定面向 ESP32-S3-Korvo-2 V3.1，不保证其他开发板可直接使用。
 - ACOS Token、Wi-Fi 密码和 MQTT 凭据属于敏感信息，不要提交到公共仓库。
 - MQTT 默认配置是开发占位值；生产环境应使用 TLS、证书校验和安全凭据存储。
-- SoftAP/HTTP 配网尚未完成，修改 Wi-Fi 时可使用编译期默认值或现有 NVS 配置。
+- 长按 SET 约 3 秒进入 SoftAP/HTTP 配网；具体热点、页面和失败恢复行为见按键控制说明。
+- ACOS 远程提醒需要平台完成 MQTT 下发以及转发 JSON 后的 WebSocket 音频下行；设备不会把 `data.text` 自行合成为语音。
 - 播放打断、AEC 和不同网络环境下的延迟仍需在真实 Korvo-2 硬件上验证。
 
 ## 相关文档
 
 - [NVS、Wi-Fi 配网和 MQTT 功能完善计划](docs/功能完善计划-NVS-WiFi配网-MQTT.md)
 - [ACOS API 对接文档](docs/ACOS API 对接V1.md)
+- [ACOS 远程定时语音提醒](docs/acos-reminders.md)
+- [ACOS 工具调用与多段回复处理](docs/acos-response-lifecycle.md)
 - [技术设计文档](docs/技术设计文档-TDD.md)

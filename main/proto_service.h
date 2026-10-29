@@ -1,7 +1,7 @@
 /**
  * proto_service.h -- ACOS V1 protocol frame parsing & construction.
  *
- *   - JSON parser: hand-written, no cJSON dependency.
+ *   - JSON parser: cJSON，按对象层级读取字段；结果持有有界副本。
  *   - Frame builders:
  *       auth                       (first message after WebSocket open)
  *       input_audio_buffer.append  (Opus, Base64 in JSON text frame)
@@ -15,7 +15,7 @@
  *     __proxy_connected__, input_audio_buffer.speech_started,
  *     input_audio_buffer.speech_stopped, response.audio.done, error.
  *
- *   Dependencies: <string.h>, <stdint.h>, esp_err.h.
+ *   Dependencies: cJSON (implementation only).
  */
 
 #ifndef PROTO_SERVICE_H
@@ -24,7 +24,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,30 +50,37 @@ typedef enum {
     /* AI reply lifecycle */
     PROTO_EVT_RESPONSE_DONE        = 5,  /* response.audio.done */
     PROTO_EVT_RESPONSE_TERMINAL    = 6,  /* response.done / explicit cancelled */
+    /* 可选兼容事件；ACOS V1 文档未保证平台发送这些扩展。 */
+    PROTO_EVT_RESPONSE_CREATED     = 7,
+    PROTO_EVT_RESPONSE_TOOL        = 8,
+    PROTO_EVT_RESPONSE_MESSAGE     = 9,
 } proto_event_t;
 
-/* ---- Parsed message view ------------------------------------------------ */
+/* ---- Parsed message (owns its strings; no JSON/cJSON lifetime dependency) -- */
+#define PROTO_RESPONSE_ID_SIZE 128
 typedef struct {
     proto_event_t  evt;             /* mapped event id                       */
-    const char    *raw_type;        /* raw type string from server           */
+    char           raw_type[80];
     int            raw_type_len;
 
     /* error frame */
     int            error_code;
-    const char    *error_code_text;
+    char           error_code_text[80];
     int            error_code_text_len;
-    const char    *error_msg;
+    char           error_msg[193]; /* 仅错误说明允许截短，不参与 ID 匹配 */
     int            error_msg_len;
 
     /* speech_started/stopped: optional session_id echoed by server */
-    const char    *session_id;
+    char           session_id[128];
     int            session_id_len;
 
     /* response.audio.done: optional reason */
-    const char    *reason;
+    char           reason[64];
     int            reason_len;
-    const char    *status;
+    char           status[32];
     int            status_len;
+    char           response_id[PROTO_RESPONSE_ID_SIZE];
+    bool           has_tool_call;
 } proto_msg_t;
 
 /* ---- Public API --------------------------------------------------------- */
@@ -90,7 +96,7 @@ typedef void (*proto_event_callback_t)(proto_event_t event);
 void proto_service_register_callback(proto_event_callback_t callback);
 proto_result_t proto_dispatch_data(const char *data, size_t len);
 
-/** No-op (struct holds only borrowed pointers). Kept for API symmetry. */
+/** Clear the caller-owned result. */
 void proto_msg_clear(proto_msg_t *msg);
 
 /**

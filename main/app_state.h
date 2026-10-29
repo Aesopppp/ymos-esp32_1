@@ -29,6 +29,7 @@ typedef enum {
     APP_STATE_SLEEP,
     APP_STATE_CANCELLING,
     APP_STATE_PROVISIONING,
+    APP_STATE_REMINDER_WAITING, /* 提醒连接/等音频；禁止开启 microphone upload */
 } app_state_t;
 
 const char *app_state_name(app_state_t state);
